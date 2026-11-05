@@ -1,5 +1,5 @@
 const KEY = "mesa-v1";
-const COLORS = ["#d7b07a", "#8fbfa8", "#e08b78", "#8eabcf", "#c48b9f", "#b7a3d6"];
+const COLORS = ["#d7b07a", "#8fbfa8", "#6aa0d8", "#d4a054", "#b7a3d6", "#7eb8c9"];
 
 const ui = {
   view: "kanban",
@@ -12,10 +12,17 @@ const ui = {
   ganttAnchor: startOfMonth(new Date()),
   timeDay: iso(new Date()),
   focus: null,
+  picker: null,
+  draftName: "",
+  draftDesc: "",
+  newColor: "",
 };
 
+let colorsRepaired = false;
 let state = load();
+if (colorsRepaired) save();
 let dragged = false;
+let ganttDrag = null;
 
 function defaultState() {
   return {
@@ -38,12 +45,31 @@ function defaultState() {
   };
 }
 
+function repairProjectColors(projects) {
+  if (!Array.isArray(projects)) return false;
+  const banned = new Set(["#e08b78", "#c48b9f"]);
+  let changed = false;
+  projects.forEach((p, i) => {
+    const c = String(p.color || "").trim().toLowerCase();
+    if (!c || banned.has(c)) {
+      p.color = COLORS[i % COLORS.length];
+      changed = true;
+    }
+  });
+  return changed;
+}
+
 function load() {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return defaultState();
     const data = JSON.parse(raw);
     const base = defaultState();
+    if (!data.colorsMigrated) {
+      repairProjectColors(data.projects);
+      data.colorsMigrated = true;
+      colorsRepaired = true;
+    }
     return {
       ...base,
       ...data,
@@ -68,6 +94,138 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
+}
+
+function clamp(n, a, b) {
+  return Math.min(b, Math.max(a, n));
+}
+
+function hsvToRgb(h, s, v) {
+  const c = v * s;
+  const hp = (h % 360) / 60;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  const m = v - c;
+  let rp = 0;
+  let gp = 0;
+  let bp = 0;
+  if (hp < 1) [rp, gp, bp] = [c, x, 0];
+  else if (hp < 2) [rp, gp, bp] = [x, c, 0];
+  else if (hp < 3) [rp, gp, bp] = [0, c, x];
+  else if (hp < 4) [rp, gp, bp] = [0, x, c];
+  else if (hp < 5) [rp, gp, bp] = [x, 0, c];
+  else [rp, gp, bp] = [c, 0, x];
+  return {
+    r: Math.round((rp + m) * 255),
+    g: Math.round((gp + m) * 255),
+    b: Math.round((bp + m) * 255),
+  };
+}
+
+function rgbToHsv(r, g, b) {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === rn) h = ((gn - bn) / d) % 6;
+    else if (max === gn) h = (bn - rn) / d + 2;
+    else h = (rn - gn) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return { h, s: max === 0 ? 0 : d / max, v: max };
+}
+
+function rgbToHex(r, g, b) {
+  const z = (n) => clamp(Math.round(n), 0, 255).toString(16).padStart(2, "0");
+  return `#${z(r)}${z(g)}${z(b)}`;
+}
+
+function hexToHsv(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || "").trim());
+  if (!m) return { h: 28, s: 0.55, v: 0.84 };
+  const n = parseInt(m[1], 16);
+  return rgbToHsv((n >> 16) & 255, (n >> 8) & 255, n & 255);
+}
+
+function pickerHex() {
+  const { r, g, b } = hsvToRgb(ui.picker.h, ui.picker.s, ui.picker.v);
+  return rgbToHex(r, g, b);
+}
+
+function paintPicker() {
+  if (!ui.picker) return;
+  const hex = pickerHex();
+  const root = document.querySelector(".picker");
+  if (root) {
+    const sv = root.querySelector("[data-sv]");
+    sv.style.backgroundColor = `hsl(${ui.picker.h}, 100%, 50%)`;
+    const knob = root.querySelector(".knob");
+    knob.style.left = `${ui.picker.s * 100}%`;
+    knob.style.top = `${(1 - ui.picker.v) * 100}%`;
+    root.querySelector(".picker-preview").style.background = hex;
+    const hue = root.querySelector("[data-hue]");
+    if (document.activeElement !== hue) hue.value = String(Math.round(ui.picker.h));
+    const rgb = hsvToRgb(ui.picker.h, ui.picker.s, ui.picker.v);
+    ["r", "g", "b"].forEach((k) => {
+      const input = root.querySelector(`[data-rgb="${k}"]`);
+      if (document.activeElement !== input) input.value = rgb[k];
+    });
+  }
+  document.querySelectorAll(`[data-color-target="${CSS.escape(ui.picker.projectId)}"]`).forEach((el) => {
+    el.style.background = hex;
+  });
+  if (ui.picker.projectId === "new") ui.newColor = hex;
+  else {
+    const p = project(ui.picker.projectId);
+    if (p) p.color = hex;
+  }
+}
+
+function commitPicker() {
+  if (!ui.picker || ui.picker.projectId === "new") return;
+  const p = project(ui.picker.projectId);
+  if (p) {
+    p.color = pickerHex();
+    save();
+  }
+}
+
+function colorPickerHtml() {
+  const { h, s, v } = ui.picker;
+  const { r, g, b } = hsvToRgb(h, s, v);
+  const hex = rgbToHex(r, g, b);
+  return `<div class="picker">
+    <div class="sv" data-sv style="background-color:hsl(${h},100%,50%)">
+      <div class="sv-layer"></div>
+      <div class="knob" style="left:${s * 100}%;top:${(1 - v) * 100}%"></div>
+    </div>
+    <div class="picker-row">
+      <i class="picker-preview" style="background:${hex}"></i>
+      <input class="hue" data-hue type="range" min="0" max="360" step="1" value="${Math.round(h)}" aria-label="Matiz">
+      <button class="icon-btn" data-act="eyedrop" title="Conta-gotas" type="button">⌖</button>
+    </div>
+    <div class="rgb-row">
+      <label>R<input data-rgb="r" class="field" value="${r}" inputmode="numeric"></label>
+      <label>G<input data-rgb="g" class="field" value="${g}" inputmode="numeric"></label>
+      <label>B<input data-rgb="b" class="field" value="${b}" inputmode="numeric"></label>
+    </div>
+  </div>`;
+}
+
+function shiftISO(s, days) {
+  if (!s || !days) return s || "";
+  return iso(addDays(parseISO(s), days));
+}
+
+function ganttCmp(a, b) {
+  const ao = a.ganttOrder ?? a.order ?? 0;
+  const bo = b.ganttOrder ?? b.order ?? 0;
+  if (ao !== bo) return ao - bo;
+  return String(a.code).localeCompare(String(b.code));
 }
 
 function iso(d) {
@@ -162,6 +320,15 @@ function isDone(t) {
 
 function logged(taskId) {
   return state.entries.filter((e) => e.taskId === taskId).reduce((a, e) => a + e.minutes, 0);
+}
+
+function sessionSeconds(taskId) {
+  if (!state.timer || state.timer.taskId !== taskId) return 0;
+  return Math.max(0, (Date.now() - state.timer.startedAt) / 1000);
+}
+
+function spentMin(taskId) {
+  return logged(taskId) + sessionSeconds(taskId) / 60;
 }
 
 function visibleTasks() {
@@ -264,14 +431,25 @@ function viewBody() {
   return ajustesView();
 }
 
+function timeBits(t) {
+  const running = state.timer?.taskId === t.id;
+  const spent = `<b class="spent" data-spent="${t.id}" data-base="${logged(t.id)}">${fmtHM(spentMin(t.id))}</b>`;
+  const session = running ? `<b class="live-session">${fmtHMS(sessionSeconds(t.id))}</b>` : "";
+  return `${spent} / ${fmtHM(t.estimateMin)}${session}`;
+}
+
 function card(t) {
   const p = project(t.projectId);
   const doneSubs = (t.subtasks || []).filter((s) => s.done).length;
   const subs = (t.subtasks || []).length;
-  return `<article class="card" draggable="true" data-task="${t.id}" data-act="open-task" data-id="${t.id}">
+  const running = state.timer?.taskId === t.id;
+  return `<article class="card${running ? " running" : ""}" draggable="true" data-task="${t.id}" data-act="open-task" data-id="${t.id}">
     <div class="card-top">
       <span class="badge">${esc(t.type || "Tarefa")}</span>
-      <span class="badge ${esc(t.priority)}">${esc(priorityLabel(t.priority))}</span>
+      <span class="card-top-right">
+        <span class="badge ${esc(t.priority)}">${esc(priorityLabel(t.priority))}</span>
+        ${running ? `<button type="button" class="card-pause" data-act="stop-timer" title="Pausar timer" aria-label="Pausar timer"><span></span><span></span></button>` : ""}
+      </span>
     </div>
     <h3>${esc(t.title)}</h3>
     <div class="tags">
@@ -280,7 +458,7 @@ function card(t) {
       ${(t.tags || []).map((tag) => `<span class="tag">${esc(tag)}</span>`).join("")}
     </div>
     <div class="card-foot">
-      <span>${fmtHM(logged(t.id))} / ${fmtHM(t.estimateMin)}</span>
+      <span class="card-time">${timeBits(t)}</span>
       <span>${subs ? `${doneSubs}/${subs}` : ""}</span>
     </div>
   </article>`;
@@ -294,10 +472,12 @@ function kanban() {
     const items = tasksIn(col.id);
     const est = items.reduce((a, t) => a + (t.estimateMin || 0), 0);
     const rep = items.reduce((a, t) => a + logged(t.id), 0);
+    const liveHere = items.some((t) => t.id === state.timer?.taskId);
+    const repNow = rep + (liveHere ? sessionSeconds(state.timer.taskId) / 60 : 0);
     return `<section class="col" data-col="${col.id}">
       <div class="col-head">
         <div><h2>${esc(col.name)} <span class="muted">${items.length}</span></h2>
-        <div class="meta">Estimado ${fmtHM(est)} · Reportado ${fmtHM(rep)}</div></div>
+        <div class="meta">Estimado ${fmtHM(est)} · Reportado <span class="spent" data-spent="${liveHere ? state.timer.taskId : ""}" data-base="${rep}">${fmtHM(repNow)}</span></div></div>
         <button class="icon-btn" data-act="new-task" data-status="${col.id}" title="Nova tarefa aqui">+</button>
       </div>
       <div class="cards">${items.map(card).join("") || `<div class="empty">Arraste tarefas para cá</div>`}</div>
@@ -310,13 +490,13 @@ function lista() {
     const items = tasksIn(col.id);
     if (!items.length) return "";
     const head = `<tr class="group"><td colspan="8">${esc(col.name)} · ${items.length}</td></tr>`;
-    const body = items.map((t) => `<tr>
+    const body = items.map((t) => `<tr class="${state.timer?.taskId === t.id ? "running" : ""}">
       <td class="muted">${esc(t.code)}</td>
       <td><button class="link ${isDone(t) ? "struck" : ""}" data-act="open-task" data-id="${t.id}">${esc(t.title)}</button></td>
       <td>${esc(project(t.projectId)?.name || "—")}</td>
       <td>${esc(t.type || "—")}</td>
       <td><span class="badge ${esc(t.priority)}">${esc(priorityLabel(t.priority))}</span></td>
-      <td>${fmtHM(logged(t.id))} / ${fmtHM(t.estimateMin)}</td>
+      <td class="card-time">${timeBits(t)}</td>
       <td>${fmtDate(t.due)}</td>
       <td>${esc(sprint(t.sprintId)?.name || "—")}</td>
     </tr>`).join("");
@@ -350,6 +530,7 @@ function ganttView() {
   const dated = [];
   const undated = [];
   visibleTasks().forEach((t) => ((t.start || t.due) ? dated : undated).push(t));
+  dated.sort(ganttCmp);
   const rows = dated.map((t) => {
     const a = parseISO(t.start || t.due);
     const b = parseISO(t.due || t.start);
@@ -362,11 +543,14 @@ function ganttView() {
     const right = Math.min(days.length - 1, daysBetween(viewStart, to));
     const width = (right - Math.max(0, daysBetween(viewStart, from)) + 1) / days.length * 100;
     const late = t.due && t.due < today && !isDone(t);
+    const running = state.timer?.taskId === t.id;
     const cls = isDone(t) ? "done" : late ? "late" : "";
     const color = cls ? "" : `background:${project(t.projectId)?.color || "#d7b07a"};color:#1a140d`;
-    return `<div class="gantt-row">
-      <div class="gantt-label"><button data-act="open-task" data-id="${t.id}">${esc(t.title)}</button><div class="meta">${esc(t.code)}</div></div>
-      <div class="track"><div class="bar ${cls}" style="left:${left}%;width:${width}%;${color}">${esc(fmtDate(t.start || t.due))}</div></div>
+    return `<div class="gantt-row${running ? " running" : ""}" data-gantt-row="${t.id}">
+      <div class="gantt-label" title="Arraste para mudar a ordem">
+        <div><button data-act="open-task" data-id="${t.id}">${esc(t.title)}</button><div class="meta">${esc(t.code)}${running ? ` · <b class="live-session">${fmtHMS(sessionSeconds(t.id))}</b>` : ""}</div></div>
+      </div>
+      <div class="track"><div class="bar ${cls}" data-gantt-bar="${t.id}" style="left:${left}%;width:${width}%;${color}" title="Arraste para mudar as datas">${esc(fmtDate(t.start || t.due))}</div></div>
     </div>`;
   }).join("");
   const label = ui.ganttMode === "week"
@@ -384,10 +568,11 @@ function ganttView() {
       <button class="btn" data-act="gantt-today">Hoje</button>
     </div>
     <div class="legend">
-      <span><i class="swatch" style="background:#d7b07a"></i>No prazo</span>
-      <span><i class="swatch" style="background:#e08b78"></i>Atrasada</span>
-      <span><i class="swatch" style="background:#8fbfa8"></i>Concluída</span>
+      <span><i class="swatch" style="background:#6aa0d8"></i>No prazo, na cor do projeto</span>
+      <span><i class="swatch is-late"></i>Atrasada, prazo anterior a hoje</span>
+      <span><i class="swatch is-done"></i>Concluída</span>
     </div>
+    <p class="meta gantt-hint">Arraste a barra na horizontal para mudar as datas. Arraste o nome na vertical para mudar a ordem.</p>
     <div class="gantt">
       <div class="gantt-head"><div class="gantt-label">Tarefa</div><div class="days" style="grid-template-columns:repeat(${days.length},1fr)">${head}</div></div>
       ${rows || `<div class="empty">Nenhuma tarefa com datas neste período.</div>`}
@@ -459,9 +644,10 @@ function projetosView() {
     const pct = tasks.length ? Math.round(done / tasks.length * 100) : 0;
     return `<article class="project">
       <div class="inline" style="justify-content:space-between"><span class="tag">${esc(p.code)}</span><span class="badge">${esc(p.status)}</span></div>
-      <h3><i class="dot" style="background:${esc(p.color)}"></i> ${esc(p.name)}</h3>
+      <h3><button class="color-btn" data-act="open-color" data-id="${p.id}" data-color-target="${p.id}" style="background:${esc(p.color)}" title="Escolher cor"></button> ${esc(p.name)}</h3>
+      ${ui.picker && ui.picker.projectId === p.id ? colorPickerHtml() : ""}
       <p class="muted">${esc(p.description || "Sem descrição.")}</p>
-      <div class="barline"><span style="width:${pct}%;background:${esc(p.color)}"></span></div>
+      <div class="barline"><span data-color-target="${p.id}" style="width:${pct}%;background:${esc(p.color)}"></span></div>
       <div class="meta">${done}/${tasks.length} tarefas · ${fmtHM(rep)} / ${fmtHM(est)}</div>
       <div class="inline" style="margin-top:10px">
         <button class="btn" data-act="filter-project" data-id="${p.id}">Ver tarefas</button>
@@ -472,8 +658,12 @@ function projetosView() {
   return `<div class="panel">
     <div class="inline" style="justify-content:space-between"><h2 style="margin:0;font-family:Georgia,serif">Projetos</h2></div>
     <div class="form-grid" style="margin:12px 0">
-      <label class="span-2">Nome<input id="proj-name" class="field" placeholder="Ex.: Estudos, Casa, Leitura"></label>
-      <label class="span-2">Descrição<textarea id="proj-desc" class="field" placeholder="Para que existe este projeto"></textarea></label>
+      <label class="span-2">Nome<input id="proj-name" class="field" placeholder="Ex.: Estudos, Casa, Leitura" value="${esc(ui.draftName || "")}"></label>
+      <label class="span-2">Descrição<textarea id="proj-desc" class="field" placeholder="Para que existe este projeto">${esc(ui.draftDesc || "")}</textarea></label>
+      <div class="color-anchor">
+        <button class="color-btn" data-act="open-color" data-id="new" data-color-target="new" style="background:${esc(ui.newColor || COLORS[state.projects.length % COLORS.length])}" title="Escolher cor"></button>
+        ${ui.picker && ui.picker.projectId === "new" ? colorPickerHtml() : ""}
+      </div>
       <button class="btn primary" data-act="new-project">Criar projeto</button>
     </div>
     <div class="card-list">${cards || `<div class="empty">Nenhum projeto. Tarefas também podem ficar soltas, sem projeto.</div>`}</div>
@@ -554,8 +744,8 @@ function drawer() {
   const statusOpts = state.columns.map((c) => `<option value="${c.id}" ${t.statusId === c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("");
   const typeOpts = state.types.map((n) => `<option ${t.type === n ? "selected" : ""}>${esc(n)}</option>`).join("");
   const sprOpts = `<option value="">Fora de sprint</option>` + state.sprints.map((s) => `<option value="${s.id}" ${t.sprintId === s.id ? "selected" : ""}>${esc(s.name)}</option>`).join("");
-  const subs = (t.subtasks || []).map((s) => `<label class="check"><input type="checkbox" data-act="toggle-sub" data-id="${s.id}" ${s.done ? "checked" : ""}><span class="${s.done ? "struck" : ""}">${esc(s.title)}</span>
-    <button class="btn danger" data-act="del-sub" data-id="${s.id}">×</button></label>`).join("");
+  const subs = (t.subtasks || []).map((s) => `<div class="check${s.done ? " is-done" : ""}"><label><input type="checkbox" data-act="toggle-sub" data-id="${s.id}" ${s.done ? "checked" : ""}><span>${esc(s.title)}</span></label>
+    <button type="button" class="sub-x" data-act="del-sub" data-id="${s.id}" title="Apagar subtarefa">×</button></div>`).join("");
   const comments = (t.comments || []).map((c) => `<div class="comment"><div>${esc(c.text)}</div><div class="meta">${esc(c.at)}</div></div>`).join("") || `<p class="muted">Ainda não há comentários.</p>`;
   const times = state.entries.filter((e) => e.taskId === t.id).map((e) => `<div class="meta">${fmtDate(e.date)} · ${fmtHM(e.minutes)} ${esc(e.note || "")}</div>`).join("") || `<p class="muted">Nenhum apontamento nesta tarefa.</p>`;
   const running = state.timer?.taskId === t.id;
@@ -567,7 +757,7 @@ function drawer() {
       </div>
       <input id="f-title" class="field" style="font-size:20px;margin:10px 0" value="${esc(t.title)}">
       <div class="inline" style="justify-content:space-between">
-        <b>${fmtHM(logged(t.id))} / ${fmtHM(t.estimateMin)}</b>
+        <b class="card-time">${timeBits(t)}</b>
         ${running ? `<button class="btn primary" data-act="stop-timer">Parar timer</button>` : `<button class="btn" data-act="start-timer" data-id="${t.id}">Iniciar timer</button>`}
       </div>
       <div class="form-grid" style="margin-top:12px">
@@ -587,9 +777,9 @@ function drawer() {
         <label class="span-2">Descrição<textarea id="f-desc" class="field">${esc(t.description || "")}</textarea></label>
       </div>
       <h3>Subtarefas</h3>
-      ${subs || `<p class="muted">Nenhuma subtarefa.</p>`}
-      <div class="inline"><input id="new-sub" class="field" placeholder="Nova subtarefa"><button class="btn" data-act="add-sub">Adicionar</button></div>
-      <h3>Tempo · ${fmtHM(logged(t.id))} registrado</h3>
+      ${subs ? `<div class="sub-list">${subs}</div>` : `<p class="muted">Nenhuma subtarefa.</p>`}
+      <div class="inline sub-add"><input id="new-sub" class="field" placeholder="Nova subtarefa"><button class="btn" data-act="add-sub">Adicionar</button></div>
+      <h3>Tempo · <span class="spent" data-spent="${t.id}" data-base="${logged(t.id)}">${fmtHM(spentMin(t.id))}</span> registrado</h3>
       ${times}
       <div class="inline"><input id="f-entry" class="field" placeholder="0:30 hoje"><button class="btn" data-act="add-entry-task">Lançar</button></div>
       <h3>Comentários</h3>
@@ -602,6 +792,11 @@ function drawer() {
 }
 
 function render() {
+  const nameField = document.getElementById("proj-name");
+  if (nameField) {
+    ui.draftName = nameField.value;
+    ui.draftDesc = document.getElementById("proj-desc")?.value || "";
+  }
   const active = document.activeElement;
   const aid = active && active.id;
   const start = active && active.selectionStart;
@@ -737,6 +932,32 @@ function onClick(e) {
   if (act === "open-task" && e.target.closest("button, a, input")) {
     if (el.dataset.act === "open-task" && el.tagName !== "BUTTON" && el.tagName !== "ARTICLE") return;
   }
+  if (e.target.closest(".picker") && act !== "eyedrop") return;
+  if (act === "open-color") {
+    const id = el.dataset.id;
+    if (ui.picker && ui.picker.projectId === id) {
+      ui.picker = null;
+      render();
+      return;
+    }
+    const hex = id === "new"
+      ? (ui.newColor || COLORS[state.projects.length % COLORS.length])
+      : (project(id)?.color || COLORS[0]);
+    ui.picker = { projectId: id, ...hexToHsv(hex) };
+    render();
+    return;
+  }
+  if (act === "eyedrop") {
+    if (!window.EyeDropper || !ui.picker) return;
+    new EyeDropper().open().then((res) => {
+      if (!ui.picker) return;
+      Object.assign(ui.picker, hexToHsv(res.sRGBHex));
+      commitPicker();
+      render();
+    }).catch(() => {});
+    return;
+  }
+  if (ui.picker) ui.picker = null;
   if (act === "nav") {
     ui.view = el.dataset.view;
     render();
@@ -781,13 +1002,7 @@ function onClick(e) {
     render();
     return;
   }
-  if (act === "toggle-sub") {
-    const t = task(ui.openId);
-    const s = t?.subtasks.find((x) => x.id === el.dataset.id);
-    if (s) s.done = el.checked;
-    save();
-    return;
-  }
+  if (act === "toggle-sub") return;
   if (act === "del-sub") {
     const t = task(ui.openId);
     t.subtasks = t.subtasks.filter((s) => s.id !== el.dataset.id);
@@ -847,10 +1062,14 @@ function onClick(e) {
       code: `P-${String(state.seq.project).padStart(3, "0")}`,
       name,
       description: document.getElementById("proj-desc").value.trim(),
-      color: COLORS[state.projects.length % COLORS.length],
+      color: ui.newColor || COLORS[state.projects.length % COLORS.length],
       status: "ativo",
     });
     state.seq.project += 1;
+    ui.newColor = "";
+    ui.draftName = "";
+    ui.draftDesc = "";
+    ui.picker = null;
     save();
     render();
     return;
@@ -1015,6 +1234,12 @@ app.addEventListener("click", (e) => {
     dragged = false;
     return;
   }
+  if (ui.picker && !e.target.closest(".picker") && !e.target.closest("[data-act='open-color']") && !e.target.closest("[data-act]")) {
+    ui.picker = null;
+    render();
+    return;
+  }
+  if (e.target.closest("[data-act='stop-timer']")) { onClick(e); return; }
   if (e.target.closest(".card") && e.target.closest("button, input, a")) return;
   onClick(e);
 });
@@ -1023,6 +1248,36 @@ app.addEventListener("change", (e) => {
   if (t.id === "filter-project") { ui.projectId = t.value; render(); return; }
   if (t.id === "filter-sprint") { ui.sprintId = t.value; render(); return; }
   if (t.id === "hide-done") { ui.hideDone = t.checked; render(); return; }
+  if (t.dataset.act === "toggle-sub") {
+    readDrawer();
+    const current = task(ui.openId);
+    const s = current?.subtasks.find((x) => x.id === t.dataset.id);
+    if (s) s.done = t.checked;
+    save();
+    const drawer = document.querySelector(".drawer");
+    const top = drawer ? drawer.scrollTop : 0;
+    render();
+    const next = document.querySelector(".drawer");
+    if (next) next.scrollTop = top;
+    return;
+  }
+  if (t.matches("[data-hue]") && ui.picker) {
+    ui.picker.h = Number(t.value);
+    commitPicker();
+    render();
+    return;
+  }
+  if (t.matches("[data-rgb]") && ui.picker) {
+    const root = t.closest(".picker");
+    const rgb = {};
+    root.querySelectorAll("[data-rgb]").forEach((input) => {
+      rgb[input.dataset.rgb] = clamp(Number(input.value) || 0, 0, 255);
+    });
+    Object.assign(ui.picker, rgbToHsv(rgb.r, rgb.g, rgb.b));
+    commitPicker();
+    render();
+    return;
+  }
   if (t.id === "import-file" && t.files[0]) {
     const reader = new FileReader();
     reader.onload = () => {
@@ -1067,12 +1322,22 @@ app.addEventListener("blur", (e) => {
   }
 }, true);
 app.addEventListener("input", (e) => {
+  if (e.target.matches("[data-hue]") && ui.picker) {
+    ui.picker.h = Number(e.target.value);
+    paintPicker();
+    return;
+  }
   if (e.target.id === "q") {
     ui.q = e.target.value;
     render();
   }
 });
 app.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && ui.picker) {
+    ui.picker = null;
+    render();
+    return;
+  }
   if (e.key === "Enter" && e.target.id === "new-sub") { e.preventDefault(); onClick({ target: document.querySelector("[data-act=add-sub]") }); }
   if (e.key === "Enter" && e.target.id === "new-comment") { e.preventDefault(); onClick({ target: document.querySelector("[data-act=add-comment]") }); }
   if (e.key === "Escape" && ui.openId) {
@@ -1083,6 +1348,7 @@ app.addEventListener("keydown", (e) => {
   }
 });
 app.addEventListener("dragstart", (e) => {
+  if (e.target.closest("[data-act='stop-timer']")) { e.preventDefault(); return; }
   const cardEl = e.target.closest("[data-task]");
   if (!cardEl) return;
   dragged = true;
@@ -1114,9 +1380,124 @@ app.addEventListener("drop", (e) => {
   render();
 });
 
+function finishGanttReorder() {
+  const shown = [...document.querySelectorAll("[data-gantt-row]")].map((row) => row.dataset.ganttRow);
+  const shownSet = new Set(shown);
+  const all = state.tasks.filter((t) => t.start || t.due).sort(ganttCmp);
+  let i = 0;
+  const next = all.map((t) => (shownSet.has(t.id) ? task(shown[i++]) : t));
+  next.forEach((t, idx) => { t.ganttOrder = idx + 1; });
+}
+
+app.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  const sv = e.target.closest("[data-sv]");
+  if (sv && ui.picker) {
+    e.preventDefault();
+    const move = (ev) => {
+      const rect = sv.getBoundingClientRect();
+      ui.picker.s = clamp((ev.clientX - rect.left) / rect.width, 0, 1);
+      ui.picker.v = clamp(1 - (ev.clientY - rect.top) / rect.height, 0, 1);
+      paintPicker();
+    };
+    move(e);
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      dragged = true;
+      commitPicker();
+      render();
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    return;
+  }
+  const bar = e.target.closest("[data-gantt-bar]");
+  if (bar) {
+    e.preventDefault();
+    const item = task(bar.dataset.ganttBar);
+    const track = bar.closest(".track");
+    const n = periodDays().length;
+    ganttDrag = {
+      kind: "bar",
+      id: item.id,
+      startX: e.clientX,
+      originStart: item.start || "",
+      originDue: item.due || "",
+      originLeft: parseFloat(bar.style.left) || 0,
+      dayWidth: Math.max(8, track.getBoundingClientRect().width / n),
+      daysCount: n,
+      days: 0,
+    };
+    return;
+  }
+  const label = e.target.closest(".gantt-label");
+  if (!label) return;
+  const row = label.closest("[data-gantt-row]");
+  ganttDrag = { kind: "row", id: row.dataset.ganttRow, startY: e.clientY, moved: false };
+});
+
+window.addEventListener("pointermove", (e) => {
+  if (!ganttDrag) return;
+  if (ganttDrag.kind === "bar") {
+    const days = Math.round((e.clientX - ganttDrag.startX) / ganttDrag.dayWidth);
+    ganttDrag.days = days;
+    const bar = document.querySelector(`[data-gantt-bar="${ganttDrag.id}"]`);
+    if (!bar) return;
+    bar.style.left = `${ganttDrag.originLeft + days * (100 / ganttDrag.daysCount)}%`;
+    bar.textContent = fmtDate(shiftISO(ganttDrag.originStart || ganttDrag.originDue, days));
+    return;
+  }
+  if (Math.abs(e.clientY - ganttDrag.startY) < 6) return;
+  ganttDrag.moved = true;
+  const from = document.querySelector(`[data-gantt-row="${ganttDrag.id}"]`);
+  if (!from) return;
+  const rows = [...document.querySelectorAll(".gantt-row")];
+  const target = rows.find((row) => {
+    if (row === from) return false;
+    const rect = row.getBoundingClientRect();
+    return e.clientY >= rect.top && e.clientY <= rect.bottom;
+  });
+  if (!target) return;
+  const rect = target.getBoundingClientRect();
+  const after = e.clientY > rect.top + rect.height / 2;
+  target.parentElement.insertBefore(from, after ? target.nextSibling : target);
+});
+
+window.addEventListener("pointerup", () => {
+  if (!ganttDrag) return;
+  const drag = ganttDrag;
+  ganttDrag = null;
+  if (drag.kind === "bar") {
+    if (!drag.days) return;
+    const item = task(drag.id);
+    item.start = drag.originStart ? shiftISO(drag.originStart, drag.days) : "";
+    item.due = drag.originDue ? shiftISO(drag.originDue, drag.days) : "";
+    save();
+    render();
+    dragged = true;
+    setTimeout(() => { dragged = false; }, 0);
+    return;
+  }
+  if (!drag.moved) return;
+  finishGanttReorder();
+  save();
+  render();
+  dragged = true;
+  setTimeout(() => { dragged = false; }, 0);
+});
+
 setInterval(() => {
-  const el = document.getElementById("live-timer");
-  if (el && state.timer) el.textContent = fmtHMS((Date.now() - state.timer.startedAt) / 1000);
+  if (!state.timer) return;
+  const sec = (Date.now() - state.timer.startedAt) / 1000;
+  const clock = fmtHMS(sec);
+  const pill = document.getElementById("live-timer");
+  if (pill) pill.textContent = clock;
+  document.querySelectorAll(".live-session").forEach((el) => { el.textContent = clock; });
+  document.querySelectorAll(".spent").forEach((el) => {
+    if (el.dataset.spent !== state.timer.taskId) return;
+    el.textContent = fmtHM(Number(el.dataset.base) + sec / 60);
+  });
 }, 1000);
 
 render();
