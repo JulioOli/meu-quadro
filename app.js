@@ -40,7 +40,7 @@ function defaultState() {
     tasks: [],
     entries: [],
     sprints: [],
-    timer: null,
+    timers: [],
     seq: { task: 1, project: 1, sprint: 1 },
   };
 }
@@ -70,6 +70,7 @@ function load() {
       data.colorsMigrated = true;
       colorsRepaired = true;
     }
+    data.timers = normalizeTimers(data);
     return {
       ...base,
       ...data,
@@ -84,6 +85,7 @@ function load() {
 
 function save() {
   localStorage.setItem(KEY, JSON.stringify(state));
+  scheduleCloud();
 }
 
 function uid() {
@@ -322,9 +324,24 @@ function logged(taskId) {
   return state.entries.filter((e) => e.taskId === taskId).reduce((a, e) => a + e.minutes, 0);
 }
 
+function normalizeTimers(data) {
+  if (Array.isArray(data.timers)) return data.timers.filter((t) => t && t.taskId && t.startedAt);
+  if (data.timer && data.timer.taskId && data.timer.startedAt) return [data.timer];
+  return [];
+}
+
+function runningTimers() {
+  return normalizeTimers(state);
+}
+
+function isRunning(taskId) {
+  return runningTimers().some((t) => t.taskId === taskId);
+}
+
 function sessionSeconds(taskId) {
-  if (!state.timer || state.timer.taskId !== taskId) return 0;
-  return Math.max(0, (Date.now() - state.timer.startedAt) / 1000);
+  const running = runningTimers().find((t) => t.taskId === taskId);
+  if (!running) return 0;
+  return Math.max(0, (Date.now() - running.startedAt) / 1000);
 }
 
 function spentMin(taskId) {
@@ -365,7 +382,10 @@ function shell() {
   return `
     <div class="app">
       <header class="top">
-        <div class="brand"><strong>Mesa</strong><span>projetos pessoais</span></div>
+        <div class="top-bar">
+          <div class="brand"><strong>Mesa</strong><span>projetos pessoais</span></div>
+          ${accountBtn()}
+        </div>
         <nav class="nav">
           ${navBtn("kanban", "Kanban")}
           ${navBtn("lista", "Lista")}
@@ -378,7 +398,7 @@ function shell() {
         ${timerPill()}
       </header>
       ${viewBody()}
-      <p class="foot">Os dados ficam neste navegador. Em Ajustes dá para exportar um backup.</p>
+      <p class="foot">Esta conta sincroniza o quadro entre os aparelhos em que você entrar com o Google.</p>
       ${drawer()}
     </div>`;
 }
@@ -387,22 +407,32 @@ function navBtn(id, label) {
   return `<button data-act="nav" data-view="${id}" class="${ui.view === id ? "active" : ""}">${label}</button>`;
 }
 
+function accountBtn() {
+  const user = window.firebase && firebase.auth && firebase.auth().currentUser;
+  if (!user) return "";
+  return `<button class="btn" data-act="sign-out" title="${esc(user.email || "Conta Google")}">Sair</button>`;
+}
+
 function timerPill() {
-  if (!state.timer) return "";
-  const t = task(state.timer.taskId);
-  const sec = Math.floor((Date.now() - state.timer.startedAt) / 1000);
-  return `<div class="timer-pill">
-    <span>${esc(t?.title || "Tarefa")}</span>
-    <b id="live-timer">${fmtHMS(sec)}</b>
-    <button class="btn primary" data-act="stop-timer">Parar</button>
-  </div>`;
+  const list = runningTimers();
+  if (!list.length) return "";
+  const pills = list.map((tm) => {
+    const t = task(tm.taskId);
+    const sec = Math.floor((Date.now() - tm.startedAt) / 1000);
+    return `<div class="timer-pill">
+      <span>${esc(t?.title || "Tarefa")}</span>
+      <b class="live-session" data-timer="${esc(tm.taskId)}">${fmtHMS(sec)}</b>
+      <button class="btn primary" data-act="stop-timer" data-id="${esc(tm.taskId)}">Parar</button>
+    </div>`;
+  }).join("");
+  return `<div class="timer-pills">${pills}</div>`;
 }
 
 function filters() {
   const projects = state.projects.map((p) => `<option value="${p.id}" ${ui.projectId === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("");
   const sprints = state.sprints.map((s) => `<option value="${s.id}" ${ui.sprintId === s.id ? "selected" : ""}>${esc(s.name)}</option>`).join("");
   return `<div class="toolbar">
-    <div class="seg">
+    <div class="seg view-seg">
       <button data-act="nav" data-view="kanban" class="${ui.view === "kanban" ? "active" : ""}">Kanban</button>
       <button data-act="nav" data-view="lista" class="${ui.view === "lista" ? "active" : ""}">Lista</button>
       <button data-act="nav" data-view="gantt" class="${ui.view === "gantt" ? "active" : ""}">Gantt</button>
@@ -432,9 +462,9 @@ function viewBody() {
 }
 
 function timeBits(t) {
-  const running = state.timer?.taskId === t.id;
+  const running = isRunning(t.id);
   const spent = `<b class="spent" data-spent="${t.id}" data-base="${logged(t.id)}">${fmtHM(spentMin(t.id))}</b>`;
-  const session = running ? `<b class="live-session">${fmtHMS(sessionSeconds(t.id))}</b>` : "";
+  const session = running ? `<b class="live-session" data-timer="${t.id}">${fmtHMS(sessionSeconds(t.id))}</b>` : "";
   return `${spent} / ${fmtHM(t.estimateMin)}${session}`;
 }
 
@@ -442,13 +472,13 @@ function card(t) {
   const p = project(t.projectId);
   const doneSubs = (t.subtasks || []).filter((s) => s.done).length;
   const subs = (t.subtasks || []).length;
-  const running = state.timer?.taskId === t.id;
+  const running = isRunning(t.id);
   return `<article class="card${running ? " running" : ""}" draggable="true" data-task="${t.id}" data-act="open-task" data-id="${t.id}">
     <div class="card-top">
       <span class="badge">${esc(t.type || "Tarefa")}</span>
       <span class="card-top-right">
         <span class="badge ${esc(t.priority)}">${esc(priorityLabel(t.priority))}</span>
-        ${running ? `<button type="button" class="card-pause" data-act="stop-timer" title="Pausar timer" aria-label="Pausar timer"><span></span><span></span></button>` : ""}
+        ${running ? `<button type="button" class="card-pause" data-act="stop-timer" data-id="${t.id}" title="Pausar timer" aria-label="Pausar timer"><span></span><span></span></button>` : ""}
       </span>
     </div>
     <h3>${esc(t.title)}</h3>
@@ -472,12 +502,12 @@ function kanban() {
     const items = tasksIn(col.id);
     const est = items.reduce((a, t) => a + (t.estimateMin || 0), 0);
     const rep = items.reduce((a, t) => a + logged(t.id), 0);
-    const liveHere = items.some((t) => t.id === state.timer?.taskId);
-    const repNow = rep + (liveHere ? sessionSeconds(state.timer.taskId) / 60 : 0);
+    const liveIds = items.filter((t) => isRunning(t.id)).map((t) => t.id);
+    const repNow = rep + liveIds.reduce((sum, id) => sum + sessionSeconds(id) / 60, 0);
     return `<section class="col" data-col="${col.id}">
       <div class="col-head">
         <div><h2>${esc(col.name)} <span class="muted">${items.length}</span></h2>
-        <div class="meta">Estimado ${fmtHM(est)} · Reportado <span class="spent" data-spent="${liveHere ? state.timer.taskId : ""}" data-base="${rep}">${fmtHM(repNow)}</span></div></div>
+        <div class="meta">Estimado ${fmtHM(est)} · Reportado <span class="spent" data-spent="${liveIds.join(",")}" data-base="${rep}">${fmtHM(repNow)}</span></div></div>
         <button class="icon-btn" data-act="new-task" data-status="${col.id}" title="Nova tarefa aqui">+</button>
       </div>
       <div class="cards">${items.map(card).join("") || `<div class="empty">Arraste tarefas para cá</div>`}</div>
@@ -490,7 +520,7 @@ function lista() {
     const items = tasksIn(col.id);
     if (!items.length) return "";
     const head = `<tr class="group"><td colspan="8">${esc(col.name)} · ${items.length}</td></tr>`;
-    const body = items.map((t) => `<tr class="${state.timer?.taskId === t.id ? "running" : ""}">
+    const body = items.map((t) => `<tr class="${isRunning(t.id) ? "running" : ""}">
       <td class="muted">${esc(t.code)}</td>
       <td><button class="link ${isDone(t) ? "struck" : ""}" data-act="open-task" data-id="${t.id}">${esc(t.title)}</button></td>
       <td>${esc(project(t.projectId)?.name || "—")}</td>
@@ -543,12 +573,12 @@ function ganttView() {
     const right = Math.min(days.length - 1, daysBetween(viewStart, to));
     const width = (right - Math.max(0, daysBetween(viewStart, from)) + 1) / days.length * 100;
     const late = t.due && t.due < today && !isDone(t);
-    const running = state.timer?.taskId === t.id;
+    const running = isRunning(t.id);
     const cls = isDone(t) ? "done" : late ? "late" : "";
     const color = cls ? "" : `background:${project(t.projectId)?.color || "#d7b07a"};color:#1a140d`;
     return `<div class="gantt-row${running ? " running" : ""}" data-gantt-row="${t.id}">
       <div class="gantt-label" title="Arraste para mudar a ordem">
-        <div><button data-act="open-task" data-id="${t.id}">${esc(t.title)}</button><div class="meta">${esc(t.code)}${running ? ` · <b class="live-session">${fmtHMS(sessionSeconds(t.id))}</b>` : ""}</div></div>
+        <div><button data-act="open-task" data-id="${t.id}">${esc(t.title)}</button><div class="meta">${esc(t.code)}${running ? ` · <b class="live-session" data-timer="${t.id}">${fmtHMS(sessionSeconds(t.id))}</b>` : ""}</div></div>
       </div>
       <div class="track"><div class="bar ${cls}" data-gantt-bar="${t.id}" style="left:${left}%;width:${width}%;${color}" title="Arraste para mudar as datas">${esc(fmtDate(t.start || t.due))}</div></div>
     </div>`;
@@ -718,10 +748,10 @@ function ajustesView() {
     <p class="muted">A coluna é o status. A inicial recebe a tarefa nova. A concluída marca o trabalho como feito.</p>
     <h3>Colunas</h3>
     ${cols}
-    <div class="inline"><input id="new-col" class="field" placeholder="Nova coluna"><button class="btn" data-act="add-col">Adicionar</button></div>
+      <div class="inline action-row"><input id="new-col" class="field" placeholder="Nova coluna"><button class="btn" data-act="add-col">Adicionar</button></div>
     <h3>Tipos de tarefa</h3>
     <div class="tags">${types}</div>
-    <div class="inline"><input id="new-type" class="field" placeholder="Novo tipo"><button class="btn" data-act="add-type">Adicionar</button></div>
+    <div class="inline action-row"><input id="new-type" class="field" placeholder="Novo tipo"><button class="btn" data-act="add-type">Adicionar</button></div>
     <h3>Backup</h3>
     <div class="inline">
       <button class="btn" data-act="export">Exportar JSON</button>
@@ -748,7 +778,7 @@ function drawer() {
     <button type="button" class="sub-x" data-act="del-sub" data-id="${s.id}" title="Apagar subtarefa">×</button></div>`).join("");
   const comments = (t.comments || []).map((c) => `<div class="comment"><div>${esc(c.text)}</div><div class="meta">${esc(c.at)}</div></div>`).join("") || `<p class="muted">Ainda não há comentários.</p>`;
   const times = state.entries.filter((e) => e.taskId === t.id).map((e) => `<div class="meta">${fmtDate(e.date)} · ${fmtHM(e.minutes)} ${esc(e.note || "")}</div>`).join("") || `<p class="muted">Nenhum apontamento nesta tarefa.</p>`;
-  const running = state.timer?.taskId === t.id;
+  const running = isRunning(t.id);
   return `<div class="drawer-back" data-act="close-drawer"></div>
     <aside class="drawer">
       <div class="inline" style="justify-content:space-between">
@@ -758,7 +788,7 @@ function drawer() {
       <input id="f-title" class="field" style="font-size:20px;margin:10px 0" value="${esc(t.title)}">
       <div class="inline" style="justify-content:space-between">
         <b class="card-time">${timeBits(t)}</b>
-        ${running ? `<button class="btn primary" data-act="stop-timer">Parar timer</button>` : `<button class="btn" data-act="start-timer" data-id="${t.id}">Iniciar timer</button>`}
+        ${running ? `<button class="btn primary" data-act="stop-timer" data-id="${t.id}">Parar timer</button>` : `<button class="btn" data-act="start-timer" data-id="${t.id}">Iniciar timer</button>`}
       </div>
       <div class="form-grid" style="margin-top:12px">
         <label>Status<select id="f-status" class="field">${statusOpts}</select></label>
@@ -778,13 +808,13 @@ function drawer() {
       </div>
       <h3>Subtarefas</h3>
       ${subs ? `<div class="sub-list">${subs}</div>` : `<p class="muted">Nenhuma subtarefa.</p>`}
-      <div class="inline sub-add"><input id="new-sub" class="field" placeholder="Nova subtarefa"><button class="btn" data-act="add-sub">Adicionar</button></div>
+      <div class="inline action-row sub-add"><input id="new-sub" class="field" placeholder="Nova subtarefa"><button class="btn" data-act="add-sub">Adicionar</button></div>
       <h3>Tempo · <span class="spent" data-spent="${t.id}" data-base="${logged(t.id)}">${fmtHM(spentMin(t.id))}</span> registrado</h3>
       ${times}
-      <div class="inline"><input id="f-entry" class="field" placeholder="0:30 hoje"><button class="btn" data-act="add-entry-task">Lançar</button></div>
+      <div class="inline action-row"><input id="f-entry" class="field" placeholder="0:30 hoje"><button class="btn" data-act="add-entry-task">Lançar</button></div>
       <h3>Comentários</h3>
       ${comments}
-      <div class="inline"><input id="new-comment" class="field" placeholder="Escrever um comentário"><button class="btn" data-act="add-comment">Enviar</button></div>
+      <div class="inline action-row"><input id="new-comment" class="field" placeholder="Escrever um comentário"><button class="btn" data-act="add-comment">Enviar</button></div>
       <hr class="sep">
       <button class="btn danger" data-act="del-task" data-id="${t.id}">Excluir tarefa</button>
       <p class="meta">Criada em ${esc(t.createdAt)}</p>
@@ -870,19 +900,24 @@ function readDrawer() {
   if (est != null) t.estimateMin = est;
 }
 
-function stopTimer() {
-  if (!state.timer) return;
-  const seconds = (Date.now() - state.timer.startedAt) / 1000;
-  if (seconds >= 15) {
-    state.entries.push({
-      id: uid(),
-      taskId: state.timer.taskId,
-      date: todayISO(),
-      minutes: Math.max(1, Math.round(seconds / 60)),
-      note: "Timer",
-    });
-  }
-  state.timer = null;
+function stopTimer(taskId) {
+  const list = runningTimers();
+  const targets = list.filter((t) => t.taskId === taskId);
+  if (!targets.length) return;
+  targets.forEach((tm) => {
+    const seconds = (Date.now() - tm.startedAt) / 1000;
+    if (seconds >= 15) {
+      state.entries.push({
+        id: uid(),
+        taskId: tm.taskId,
+        date: todayISO(),
+        minutes: Math.max(1, Math.round(seconds / 60)),
+        note: "Timer",
+      });
+    }
+  });
+  state.timers = list.filter((t) => t.taskId !== taskId);
+  delete state.timer;
   save();
 }
 
@@ -958,6 +993,11 @@ function onClick(e) {
     return;
   }
   if (ui.picker) ui.picker = null;
+  if (act === "sign-out") {
+    cloudReady = false;
+    firebase.auth().signOut();
+    return;
+  }
   if (act === "nav") {
     ui.view = el.dataset.view;
     render();
@@ -981,22 +1021,24 @@ function onClick(e) {
     return;
   }
   if (act === "start-timer") {
-    stopTimer();
-    state.timer = { taskId: el.dataset.id, startedAt: Date.now() };
+    const id = el.dataset.id;
+    if (!id || isRunning(id)) return;
+    state.timers = runningTimers().concat([{ taskId: id, startedAt: Date.now() }]);
+    delete state.timer;
     save();
     render();
     return;
   }
   if (act === "stop-timer") {
-    stopTimer();
+    stopTimer(el.dataset.id);
     render();
     return;
   }
   if (act === "del-task") {
     if (!confirm("Excluir esta tarefa e os tempos dela?")) return;
+    stopTimer(el.dataset.id);
     state.tasks = state.tasks.filter((t) => t.id !== el.dataset.id);
     state.entries = state.entries.filter((en) => en.taskId !== el.dataset.id);
-    if (state.timer?.taskId === el.dataset.id) state.timer = null;
     ui.openId = null;
     save();
     render();
@@ -1488,16 +1530,141 @@ window.addEventListener("pointerup", () => {
 });
 
 setInterval(() => {
-  if (!state.timer) return;
-  const sec = (Date.now() - state.timer.startedAt) / 1000;
-  const clock = fmtHMS(sec);
-  const pill = document.getElementById("live-timer");
-  if (pill) pill.textContent = clock;
-  document.querySelectorAll(".live-session").forEach((el) => { el.textContent = clock; });
+  const running = runningTimers();
+  if (!running.length) return;
+  document.querySelectorAll(".live-session").forEach((el) => {
+    el.textContent = fmtHMS(sessionSeconds(el.dataset.timer));
+  });
   document.querySelectorAll(".spent").forEach((el) => {
-    if (el.dataset.spent !== state.timer.taskId) return;
-    el.textContent = fmtHM(Number(el.dataset.base) + sec / 60);
+    const extra = String(el.dataset.spent || "").split(",").filter((id) => isRunning(id))
+      .reduce((sum, id) => sum + sessionSeconds(id), 0);
+    if (!extra && !isRunning(el.dataset.spent)) return;
+    el.textContent = fmtHM(Number(el.dataset.base) + extra / 60);
   });
 }, 1000);
 
-render();
+const cloudClientId = Math.random().toString(36).slice(2, 10);
+let cloudReady = false;
+let cloudListening = false;
+let applyingRemote = false;
+let pushTimer = null;
+
+function scheduleCloud() {
+  if (applyingRemote || !cloudReady || !window.firebase || !firebase.auth().currentUser) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(pushCloud, 400);
+}
+
+function boardRef() {
+  return firebase.firestore().collection("users").doc(firebase.auth().currentUser.uid).collection("board").doc("state");
+}
+
+function pushCloud() {
+  if (!cloudReady || !firebase.auth().currentUser) return;
+  const payload = JSON.parse(JSON.stringify(state));
+  payload.writer = cloudClientId;
+  payload.updatedAt = firebase.firestore.FieldValue.serverTimestamp();
+  boardRef().set(payload).catch(() => {});
+}
+
+function adoptRemote(data) {
+  const millis = data.updatedAt && data.updatedAt.toMillis ? data.updatedAt.toMillis() : Date.now();
+  const copy = { ...data, updatedAt: millis };
+  delete copy.writer;
+  const base = defaultState();
+  applyingRemote = true;
+  state = {
+    ...base,
+    ...copy,
+    columns: copy.columns?.length ? copy.columns : base.columns,
+    types: copy.types?.length ? copy.types : base.types,
+    seq: { ...base.seq, ...(copy.seq || {}) },
+  };
+  state.timers = normalizeTimers(state);
+  delete state.timer;
+  localStorage.setItem(KEY, JSON.stringify(state));
+  applyingRemote = false;
+  render();
+}
+
+function startSync() {
+  cloudReady = true;
+  if (!cloudListening) {
+    cloudListening = true;
+    boardRef().onSnapshot((snap) => {
+      if (!snap.exists) {
+        if ((state.tasks || []).length || (state.projects || []).length || (state.entries || []).length) pushCloud();
+        return;
+      }
+      const data = snap.data();
+      if (data.writer === cloudClientId) return;
+      adoptRemote(data);
+    });
+  }
+  render();
+}
+
+function authMessage(code) {
+  if (code === "auth/unauthorized-domain") return "Este endereço ainda não está autorizado no Firebase.";
+  if (code === "auth/operation-not-allowed") return "O login com Google ainda não foi ativado neste projeto.";
+  if (code === "auth/popup-blocked") return "O navegador bloqueou a janela de login.";
+  return "Não consegui entrar. Tente de novo.";
+}
+
+function googleProvider() {
+  const provider = new firebase.auth.GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: "select_account" });
+  return provider;
+}
+
+function signInGoogle() {
+  const provider = googleProvider();
+  firebase.auth().signInWithPopup(provider).catch((err) => {
+    const code = err && err.code;
+    if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") return;
+    if (code === "auth/popup-blocked") {
+      loginScreen("O navegador bloqueou a janela do Google. Permita pop-ups para iioulos.web.app e tente de novo.");
+      return;
+    }
+    loginScreen(authMessage(code));
+  });
+}
+
+function loginScreen(message) {
+  document.getElementById("app").innerHTML = `
+    <div class="gate">
+      <strong>Mesa</strong>
+      <p>Entre com a mesma conta Google no computador e no celular. Uma tarefa criada num aparelho aparece no outro.</p>
+      <button class="btn primary" id="google-login" type="button">Entrar com Google</button>
+      <p class="meta">${esc(message || "")}</p>
+    </div>`;
+  document.getElementById("google-login").onclick = () => signInGoogle();
+}
+
+function boot() {
+  if (!window.firebase || !window.firebaseConfig) {
+    render();
+    return;
+  }
+  if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
+  const auth = firebase.auth();
+  let redirectError = "";
+  auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL)
+    .then(() => auth.getRedirectResult())
+    .catch((err) => {
+      if (err && err.code && err.code !== "auth/no-auth-event") redirectError = authMessage(err.code);
+    })
+    .then(() => firebase.firestore().enablePersistence({ synchronizeTabs: true }).catch(() => {}))
+    .then(() => {
+      auth.onAuthStateChanged((user) => {
+        if (!user) {
+          cloudReady = false;
+          loginScreen(redirectError);
+          return;
+        }
+        startSync();
+      });
+    });
+}
+
+boot();

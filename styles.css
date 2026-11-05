@@ -63,8 +63,14 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 }
 .nav button:hover, .seg button:hover, .icon-btn:hover { border-color: var(--line); }
 
-.timer-pill {
+.timer-pills {
   margin-left: auto;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.timer-pill {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -391,9 +397,77 @@ textarea.field { min-height: 90px; resize: vertical; }
 .inline { display: flex; gap: 8px; align-items: center; }
 hr.sep { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
 .foot { color: var(--faint); font-size: 12px; padding: 8px 20px 20px; }
+.gate {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 14px;
+  max-width: 420px;
+  margin: 0 auto;
+  padding: 32px 20px;
+}
+.gate strong { font-family: var(--serif); font-size: 40px; font-weight: 600; }
+.gate p { margin: 0; color: var(--muted); }
+
+.top-bar { display: contents; }
+.table-wrap { overflow-x: auto; }
 
 @media (max-width: 900px) {
   .grid-2 { grid-template-columns: 1fr; }
-  .timer-pill { display: none; }
-  .top { align-items: flex-start; flex-direction: column; }
+}
+
+@media (max-width: 760px) {
+  body { overflow-x: hidden; }
+  .top {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+    padding: calc(10px + env(safe-area-inset-top)) 12px 10px;
+  }
+  .top-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .brand { min-width: 0; flex-direction: row; align-items: baseline; gap: 8px; }
+  .brand span { display: none; }
+  .nav {
+    width: 100%;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+  .nav button, .seg button, .btn { min-height: 40px; }
+  .nav button { flex: 0 0 auto; }
+  .timer-pills { width: 100%; justify-content: stretch; }
+  .timer-pill { width: 100%; }
+  .timer-pill span { max-width: none; flex: 1; }
+  .toolbar { padding: 10px 12px; }
+  .panel .inline { flex-wrap: wrap; }
+  .toolbar > .view-seg { display: none; }
+  .toolbar .search, .toolbar select.field, .toolbar .btn { width: 100% !important; }
+  .board {
+    scroll-snap-type: x mandatory;
+    scroll-padding-inline: 12px;
+    padding: 0 12px 16px;
+    gap: 10px;
+  }
+  .col {
+    width: 86vw;
+    flex-basis: 86vw;
+    scroll-snap-align: start;
+  }
+  .table-wrap, .panel, .gantt, .sheet { margin: 0 12px 16px; }
+  .gantt-head, .gantt-row { grid-template-columns: 128px 1fr; min-width: 560px; }
+  .week { display: flex; overflow-x: auto; gap: 8px; scroll-snap-type: x mandatory; }
+  .day-card { flex: 0 0 104px; scroll-snap-align: start; }
+  .drawer {
+    width: 100vw;
+    height: 100dvh;
+    border-left: 0;
+    padding: calc(14px + env(safe-area-inset-top)) 14px calc(18px + env(safe-area-inset-bottom));
+  }
+  .form-grid { grid-template-columns: 1fr; }
+  .span-2 { grid-column: auto; }
+  .action-row { flex-direction: column; align-items: stretch; }
+  .action-row .btn { width: 100%; }
+  input, select, textarea { font-size: 16px; }
+  .foot { padding: 8px 12px calc(12px + env(safe-area-inset-bottom)); }
 }
