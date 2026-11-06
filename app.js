@@ -23,6 +23,7 @@ let state = load();
 if (colorsRepaired) save();
 let dragged = false;
 let ganttDrag = null;
+let subDrag = null;
 
 function defaultState() {
   return {
@@ -320,14 +321,20 @@ function isDone(t) {
   return column(t.statusId)?.kind === "done";
 }
 
-function logged(taskId) {
-  return state.entries.filter((e) => e.taskId === taskId).reduce((a, e) => a + e.minutes, 0);
+function logged(taskId, subtaskId) {
+  return state.entries.filter((e) => e.taskId === taskId && (subtaskId === undefined || e.subtaskId === subtaskId))
+    .reduce((a, e) => a + e.minutes, 0);
 }
 
 function normalizeTimers(data) {
-  if (Array.isArray(data.timers)) return data.timers.filter((t) => t && t.taskId && t.startedAt);
-  if (data.timer && data.timer.taskId && data.timer.startedAt) return [data.timer];
-  return [];
+  const list = Array.isArray(data.timers)
+    ? data.timers
+    : (data.timer && data.timer.taskId && data.timer.startedAt ? [data.timer] : []);
+  return list.filter((t) => t && t.taskId && t.startedAt).map((t) => {
+    const row = { taskId: t.taskId, startedAt: t.startedAt };
+    if (t.subtaskId) row.subtaskId = t.subtaskId;
+    return row;
+  });
 }
 
 function runningTimers() {
@@ -335,17 +342,37 @@ function runningTimers() {
 }
 
 function isRunning(taskId) {
+  return runningTimers().some((t) => t.taskId === taskId && !t.subtaskId);
+}
+
+function isSubRunning(taskId, subtaskId) {
+  return runningTimers().some((t) => t.taskId === taskId && t.subtaskId === subtaskId);
+}
+
+function taskLive(taskId) {
   return runningTimers().some((t) => t.taskId === taskId);
 }
 
 function sessionSeconds(taskId) {
-  const running = runningTimers().find((t) => t.taskId === taskId);
+  const running = runningTimers().find((t) => t.taskId === taskId && !t.subtaskId);
   if (!running) return 0;
   return Math.max(0, (Date.now() - running.startedAt) / 1000);
 }
 
+function liveSeconds(taskId, subtaskId) {
+  return runningTimers()
+    .filter((t) => t.taskId === taskId && (subtaskId === undefined || t.subtaskId === subtaskId))
+    .reduce((sum, t) => sum + Math.max(0, (Date.now() - t.startedAt) / 1000), 0);
+}
+
 function spentMin(taskId) {
-  return logged(taskId) + sessionSeconds(taskId) / 60;
+  return logged(taskId) + liveSeconds(taskId) / 60;
+}
+
+function splitTimerKey(key) {
+  const i = String(key).indexOf(":");
+  if (i < 0) return [key, ""];
+  return [key.slice(0, i), key.slice(i + 1)];
 }
 
 function visibleTasks() {
@@ -418,11 +445,19 @@ function timerPill() {
   if (!list.length) return "";
   const pills = list.map((tm) => {
     const t = task(tm.taskId);
+    const sub = tm.subtaskId ? (t?.subtasks || []).find((s) => s.id === tm.subtaskId) : null;
+    const label = sub ? `${t?.title || "Tarefa"} · ${sub.title}` : (t?.title || "Tarefa");
     const sec = Math.floor((Date.now() - tm.startedAt) / 1000);
+    const clock = sub
+      ? `<b class="live-session" data-subtimer="${esc(tm.taskId)}:${esc(tm.subtaskId)}">${fmtHMS(sec)}</b>`
+      : `<b class="live-session" data-timer="${esc(tm.taskId)}">${fmtHMS(sec)}</b>`;
+    const stop = sub
+      ? `<button class="btn primary" data-act="stop-sub-timer" data-id="${esc(tm.taskId)}" data-sub="${esc(tm.subtaskId)}">Parar</button>`
+      : `<button class="btn primary" data-act="stop-timer" data-id="${esc(tm.taskId)}">Parar</button>`;
     return `<div class="timer-pill">
-      <span>${esc(t?.title || "Tarefa")}</span>
-      <b class="live-session" data-timer="${esc(tm.taskId)}">${fmtHMS(sec)}</b>
-      <button class="btn primary" data-act="stop-timer" data-id="${esc(tm.taskId)}">Parar</button>
+      <span>${esc(label)}</span>
+      ${clock}
+      ${stop}
     </div>`;
   }).join("");
   return `<div class="timer-pills">${pills}</div>`;
@@ -462,9 +497,9 @@ function viewBody() {
 }
 
 function timeBits(t) {
-  const running = isRunning(t.id);
+  const live = liveSeconds(t.id);
   const spent = `<b class="spent" data-spent="${t.id}" data-base="${logged(t.id)}">${fmtHM(spentMin(t.id))}</b>`;
-  const session = running ? `<b class="live-session" data-timer="${t.id}">${fmtHMS(sessionSeconds(t.id))}</b>` : "";
+  const session = live ? `<b class="live-session" data-live="${t.id}">${fmtHMS(live)}</b>` : "";
   return `${spent} / ${fmtHM(t.estimateMin)}${session}`;
 }
 
@@ -472,13 +507,13 @@ function card(t) {
   const p = project(t.projectId);
   const doneSubs = (t.subtasks || []).filter((s) => s.done).length;
   const subs = (t.subtasks || []).length;
-  const running = isRunning(t.id);
+  const running = taskLive(t.id);
   return `<article class="card${running ? " running" : ""}" draggable="true" data-task="${t.id}" data-act="open-task" data-id="${t.id}">
     <div class="card-top">
       <span class="badge">${esc(t.type || "Tarefa")}</span>
       <span class="card-top-right">
         <span class="badge ${esc(t.priority)}">${esc(priorityLabel(t.priority))}</span>
-        ${running ? `<button type="button" class="card-pause" data-act="stop-timer" data-id="${t.id}" title="Pausar timer" aria-label="Pausar timer"><span></span><span></span></button>` : ""}
+        ${running ? `<button type="button" class="card-pause" data-act="stop-task-timers" data-id="${t.id}" title="Pausar timer" aria-label="Pausar timer"><span></span><span></span></button>` : ""}
       </span>
     </div>
     <h3>${esc(t.title)}</h3>
@@ -502,8 +537,8 @@ function kanban() {
     const items = tasksIn(col.id);
     const est = items.reduce((a, t) => a + (t.estimateMin || 0), 0);
     const rep = items.reduce((a, t) => a + logged(t.id), 0);
-    const liveIds = items.filter((t) => isRunning(t.id)).map((t) => t.id);
-    const repNow = rep + liveIds.reduce((sum, id) => sum + sessionSeconds(id) / 60, 0);
+    const liveIds = items.filter((t) => taskLive(t.id)).map((t) => t.id);
+    const repNow = rep + liveIds.reduce((sum, id) => sum + liveSeconds(id) / 60, 0);
     return `<section class="col" data-col="${col.id}">
       <div class="col-head">
         <div><h2>${esc(col.name)} <span class="muted">${items.length}</span></h2>
@@ -520,7 +555,7 @@ function lista() {
     const items = tasksIn(col.id);
     if (!items.length) return "";
     const head = `<tr class="group"><td colspan="8">${esc(col.name)} · ${items.length}</td></tr>`;
-    const body = items.map((t) => `<tr class="${isRunning(t.id) ? "running" : ""}">
+    const body = items.map((t) => `<tr class="${taskLive(t.id) ? "running" : ""}">
       <td class="muted">${esc(t.code)}</td>
       <td><button class="link ${isDone(t) ? "struck" : ""}" data-act="open-task" data-id="${t.id}">${esc(t.title)}</button></td>
       <td>${esc(project(t.projectId)?.name || "—")}</td>
@@ -573,12 +608,12 @@ function ganttView() {
     const right = Math.min(days.length - 1, daysBetween(viewStart, to));
     const width = (right - Math.max(0, daysBetween(viewStart, from)) + 1) / days.length * 100;
     const late = t.due && t.due < today && !isDone(t);
-    const running = isRunning(t.id);
+    const running = taskLive(t.id);
     const cls = isDone(t) ? "done" : late ? "late" : "";
     const color = cls ? "" : `background:${project(t.projectId)?.color || "#d7b07a"};color:#1a140d`;
     return `<div class="gantt-row${running ? " running" : ""}" data-gantt-row="${t.id}">
       <div class="gantt-label" title="Arraste para mudar a ordem">
-        <div><button data-act="open-task" data-id="${t.id}">${esc(t.title)}</button><div class="meta">${esc(t.code)}${running ? ` · <b class="live-session" data-timer="${t.id}">${fmtHMS(sessionSeconds(t.id))}</b>` : ""}</div></div>
+        <div><button data-act="open-task" data-id="${t.id}">${esc(t.title)}</button><div class="meta">${esc(t.code)}${running ? ` · <b class="live-session" data-live="${t.id}">${fmtHMS(liveSeconds(t.id))}</b>` : ""}</div></div>
       </div>
       <div class="track"><div class="bar ${cls}" data-gantt-bar="${t.id}" style="left:${left}%;width:${width}%;${color}" title="Arraste para mudar as datas">${esc(fmtDate(t.start || t.due))}</div></div>
     </div>`;
@@ -767,6 +802,25 @@ function priorityLabel(p) {
   return { baixa: "Baixa", media: "Média", alta: "Alta" }[p] || "Média";
 }
 
+function subtaskRow(t, s) {
+  const running = isSubRunning(t.id, s.id);
+  const base = logged(t.id, s.id);
+  const shown = base + (running ? liveSeconds(t.id, s.id) / 60 : 0);
+  const key = `${t.id}:${s.id}`;
+  const toggle = running
+    ? `<button type="button" class="sub-act sub-pause" data-act="stop-sub-timer" data-id="${esc(t.id)}" data-sub="${esc(s.id)}" title="Parar timer" aria-label="Parar timer"><span></span><span></span></button>`
+    : `<button type="button" class="sub-act sub-play" data-act="start-sub-timer" data-id="${esc(t.id)}" data-sub="${esc(s.id)}" title="Iniciar timer" aria-label="Iniciar timer"></button>`;
+  return `<div class="check sub-row${s.done ? " is-done" : ""}${running ? " is-running" : ""}" data-sub="${esc(s.id)}">
+    <button type="button" class="sub-grip" data-sub="${esc(s.id)}" title="Arrastar para reordenar" aria-label="Reordenar subtarefa">⋮⋮</button>
+    <label><input type="checkbox" data-act="toggle-sub" data-id="${esc(s.id)}" ${s.done ? "checked" : ""}><span>${esc(s.title)}</span></label>
+    <span class="sub-tools">
+      <span class="sub-clock" title="Tempo nesta subtarefa"><b class="spent" data-subspent="${esc(key)}" data-base="${base}">${fmtHM(shown)}</b>${running ? `<b class="live-session" data-subtimer="${esc(key)}">${fmtHMS(liveSeconds(t.id, s.id))}</b>` : ""}</span>
+      ${toggle}
+      <button type="button" class="sub-x" data-act="del-sub" data-id="${esc(s.id)}" title="Apagar subtarefa" aria-label="Apagar subtarefa">×</button>
+    </span>
+  </div>`;
+}
+
 function drawer() {
   const t = task(ui.openId);
   if (!t) return "";
@@ -774,8 +828,8 @@ function drawer() {
   const statusOpts = state.columns.map((c) => `<option value="${c.id}" ${t.statusId === c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("");
   const typeOpts = state.types.map((n) => `<option ${t.type === n ? "selected" : ""}>${esc(n)}</option>`).join("");
   const sprOpts = `<option value="">Fora de sprint</option>` + state.sprints.map((s) => `<option value="${s.id}" ${t.sprintId === s.id ? "selected" : ""}>${esc(s.name)}</option>`).join("");
-  const subs = (t.subtasks || []).map((s) => `<div class="check${s.done ? " is-done" : ""}"><label><input type="checkbox" data-act="toggle-sub" data-id="${s.id}" ${s.done ? "checked" : ""}><span>${esc(s.title)}</span></label>
-    <button type="button" class="sub-x" data-act="del-sub" data-id="${s.id}" title="Apagar subtarefa">×</button></div>`).join("");
+  const subs = (t.subtasks || []).map((s) => subtaskRow(t, s)).join("");
+  const subHint = (t.subtasks || []).length > 1 ? `<p class="meta sub-hint">Arraste o ícone à esquerda para mudar a ordem.</p>` : "";
   const comments = (t.comments || []).map((c) => `<div class="comment"><div>${esc(c.text)}</div><div class="meta">${esc(c.at)}</div></div>`).join("") || `<p class="muted">Ainda não há comentários.</p>`;
   const times = state.entries.filter((e) => e.taskId === t.id).map((e) => `<div class="meta">${fmtDate(e.date)} · ${fmtHM(e.minutes)} ${esc(e.note || "")}</div>`).join("") || `<p class="muted">Nenhum apontamento nesta tarefa.</p>`;
   const running = isRunning(t.id);
@@ -807,6 +861,7 @@ function drawer() {
         <label class="span-2">Descrição<textarea id="f-desc" class="field">${esc(t.description || "")}</textarea></label>
       </div>
       <h3>Subtarefas</h3>
+      ${subHint}
       ${subs ? `<div class="sub-list">${subs}</div>` : `<p class="muted">Nenhuma subtarefa.</p>`}
       <div class="inline action-row sub-add"><input id="new-sub" class="field" placeholder="Nova subtarefa"><button class="btn" data-act="add-sub">Adicionar</button></div>
       <h3>Tempo · <span class="spent" data-spent="${t.id}" data-base="${logged(t.id)}">${fmtHM(spentMin(t.id))}</span> registrado</h3>
@@ -819,6 +874,14 @@ function drawer() {
       <button class="btn danger" data-act="del-task" data-id="${t.id}">Excluir tarefa</button>
       <p class="meta">Criada em ${esc(t.createdAt)}</p>
     </aside>`;
+}
+
+function renderKeepingDrawer() {
+  const drawer = document.querySelector(".drawer");
+  const top = drawer ? drawer.scrollTop : 0;
+  render();
+  const next = document.querySelector(".drawer");
+  if (next) next.scrollTop = top;
 }
 
 function render() {
@@ -900,25 +963,41 @@ function readDrawer() {
   if (est != null) t.estimateMin = est;
 }
 
-function stopTimer(taskId) {
+function stopMatching(pred) {
   const list = runningTimers();
-  const targets = list.filter((t) => t.taskId === taskId);
+  const targets = list.filter(pred);
   if (!targets.length) return;
   targets.forEach((tm) => {
     const seconds = (Date.now() - tm.startedAt) / 1000;
     if (seconds >= 15) {
-      state.entries.push({
+      const parent = task(tm.taskId);
+      const sub = tm.subtaskId ? (parent?.subtasks || []).find((s) => s.id === tm.subtaskId) : null;
+      const entry = {
         id: uid(),
         taskId: tm.taskId,
         date: todayISO(),
         minutes: Math.max(1, Math.round(seconds / 60)),
-        note: "Timer",
-      });
+        note: sub ? `Timer · ${sub.title}` : "Timer",
+      };
+      if (tm.subtaskId) entry.subtaskId = tm.subtaskId;
+      state.entries.push(entry);
     }
   });
-  state.timers = list.filter((t) => t.taskId !== taskId);
+  state.timers = list.filter((t) => !pred(t));
   delete state.timer;
   save();
+}
+
+function stopTimer(taskId) {
+  stopMatching((t) => t.taskId === taskId && !t.subtaskId);
+}
+
+function stopSubTimer(taskId, subtaskId) {
+  stopMatching((t) => t.taskId === taskId && t.subtaskId === subtaskId);
+}
+
+function stopTaskTimers(taskId) {
+  stopMatching((t) => t.taskId === taskId);
 }
 
 function seed() {
@@ -1026,17 +1105,38 @@ function onClick(e) {
     state.timers = runningTimers().concat([{ taskId: id, startedAt: Date.now() }]);
     delete state.timer;
     save();
-    render();
+    renderKeepingDrawer();
     return;
   }
   if (act === "stop-timer") {
     stopTimer(el.dataset.id);
-    render();
+    renderKeepingDrawer();
+    return;
+  }
+  if (act === "stop-task-timers") {
+    stopTaskTimers(el.dataset.id);
+    renderKeepingDrawer();
+    return;
+  }
+  if (act === "start-sub-timer") {
+    const id = el.dataset.id;
+    const sub = el.dataset.sub;
+    const parent = task(id);
+    if (!id || !sub || isSubRunning(id, sub) || !parent?.subtasks?.some((s) => s.id === sub)) return;
+    state.timers = runningTimers().concat([{ taskId: id, subtaskId: sub, startedAt: Date.now() }]);
+    delete state.timer;
+    save();
+    renderKeepingDrawer();
+    return;
+  }
+  if (act === "stop-sub-timer") {
+    stopSubTimer(el.dataset.id, el.dataset.sub);
+    renderKeepingDrawer();
     return;
   }
   if (act === "del-task") {
     if (!confirm("Excluir esta tarefa e os tempos dela?")) return;
-    stopTimer(el.dataset.id);
+    stopTaskTimers(el.dataset.id);
     state.tasks = state.tasks.filter((t) => t.id !== el.dataset.id);
     state.entries = state.entries.filter((en) => en.taskId !== el.dataset.id);
     ui.openId = null;
@@ -1047,9 +1147,10 @@ function onClick(e) {
   if (act === "toggle-sub") return;
   if (act === "del-sub") {
     const t = task(ui.openId);
+    stopSubTimer(ui.openId, el.dataset.id);
     t.subtasks = t.subtasks.filter((s) => s.id !== el.dataset.id);
     save();
-    render();
+    renderKeepingDrawer();
     return;
   }
   if (act === "add-sub") {
@@ -1058,7 +1159,7 @@ function onClick(e) {
     if (!title) return;
     task(ui.openId).subtasks.push({ id: uid(), title, done: false });
     save();
-    render();
+    renderKeepingDrawer();
     return;
   }
   if (act === "add-comment") {
@@ -1281,7 +1382,7 @@ app.addEventListener("click", (e) => {
     render();
     return;
   }
-  if (e.target.closest("[data-act='stop-timer']")) { onClick(e); return; }
+  if (e.target.closest("[data-act='stop-timer'], [data-act='stop-task-timers']")) { onClick(e); return; }
   if (e.target.closest(".card") && e.target.closest("button, input, a")) return;
   onClick(e);
 });
@@ -1296,11 +1397,7 @@ app.addEventListener("change", (e) => {
     const s = current?.subtasks.find((x) => x.id === t.dataset.id);
     if (s) s.done = t.checked;
     save();
-    const drawer = document.querySelector(".drawer");
-    const top = drawer ? drawer.scrollTop : 0;
-    render();
-    const next = document.querySelector(".drawer");
-    if (next) next.scrollTop = top;
+    renderKeepingDrawer();
     return;
   }
   if (t.matches("[data-hue]") && ui.picker) {
@@ -1390,7 +1487,7 @@ app.addEventListener("keydown", (e) => {
   }
 });
 app.addEventListener("dragstart", (e) => {
-  if (e.target.closest("[data-act='stop-timer']")) { e.preventDefault(); return; }
+  if (e.target.closest("[data-act='stop-timer'], [data-act='stop-task-timers'], .sub-row")) { e.preventDefault(); return; }
   const cardEl = e.target.closest("[data-task]");
   if (!cardEl) return;
   dragged = true;
@@ -1431,8 +1528,38 @@ function finishGanttReorder() {
   next.forEach((t, idx) => { t.ganttOrder = idx + 1; });
 }
 
+function endSubDrag() {
+  if (!subDrag) return;
+  const drag = subDrag;
+  subDrag = null;
+  drag.row.classList.remove("is-dragging");
+  if (!drag.moved) return;
+  readDrawer();
+  const current = task(ui.openId);
+  if (!current) return;
+  const ids = [...drag.list.querySelectorAll(".sub-row")].map((row) => row.dataset.sub);
+  const byId = new Map(current.subtasks.map((s) => [s.id, s]));
+  const next = ids.map((id) => byId.get(id)).filter(Boolean);
+  current.subtasks.forEach((s) => { if (!next.includes(s)) next.push(s); });
+  if (next.length === current.subtasks.length && next.every((s, i) => s === current.subtasks[i])) return;
+  current.subtasks = next;
+  save();
+  renderKeepingDrawer();
+  dragged = true;
+  setTimeout(() => { dragged = false; }, 0);
+}
+
 app.addEventListener("pointerdown", (e) => {
   if (e.button !== 0) return;
+  const grip = e.target.closest(".sub-grip");
+  if (grip) {
+    const row = grip.closest(".sub-row");
+    const list = row && row.parentElement;
+    if (!row || !list || !list.classList.contains("sub-list")) return;
+    e.preventDefault();
+    subDrag = { id: row.dataset.sub, startY: e.clientY, moved: false, row, list };
+    return;
+  }
   const sv = e.target.closest("[data-sv]");
   if (sv && ui.picker) {
     e.preventDefault();
@@ -1480,6 +1607,22 @@ app.addEventListener("pointerdown", (e) => {
 });
 
 window.addEventListener("pointermove", (e) => {
+  if (subDrag) {
+    if (!subDrag.moved && Math.abs(e.clientY - subDrag.startY) < 4) return;
+    subDrag.moved = true;
+    subDrag.row.classList.add("is-dragging");
+    const rows = [...subDrag.list.querySelectorAll(".sub-row")].filter((row) => row !== subDrag.row);
+    let before = null;
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect();
+      if (e.clientY < rect.top + rect.height / 2) {
+        before = row;
+        break;
+      }
+    }
+    if (subDrag.row.nextElementSibling !== before) subDrag.list.insertBefore(subDrag.row, before);
+    return;
+  }
   if (!ganttDrag) return;
   if (ganttDrag.kind === "bar") {
     const days = Math.round((e.clientX - ganttDrag.startX) / ganttDrag.dayWidth);
@@ -1507,6 +1650,10 @@ window.addEventListener("pointermove", (e) => {
 });
 
 window.addEventListener("pointerup", () => {
+  if (subDrag) {
+    endSubDrag();
+    return;
+  }
   if (!ganttDrag) return;
   const drag = ganttDrag;
   ganttDrag = null;
@@ -1529,16 +1676,30 @@ window.addEventListener("pointerup", () => {
   setTimeout(() => { dragged = false; }, 0);
 });
 
+window.addEventListener("pointercancel", () => endSubDrag());
+
 setInterval(() => {
-  const running = runningTimers();
-  if (!running.length) return;
+  if (!runningTimers().length) return;
   document.querySelectorAll(".live-session").forEach((el) => {
-    el.textContent = fmtHMS(sessionSeconds(el.dataset.timer));
+    if (el.dataset.subtimer) {
+      const [taskId, subId] = splitTimerKey(el.dataset.subtimer);
+      el.textContent = fmtHMS(liveSeconds(taskId, subId));
+    } else if (el.dataset.live) {
+      el.textContent = fmtHMS(liveSeconds(el.dataset.live));
+    } else if (el.dataset.timer) {
+      el.textContent = fmtHMS(sessionSeconds(el.dataset.timer));
+    }
   });
   document.querySelectorAll(".spent").forEach((el) => {
-    const extra = String(el.dataset.spent || "").split(",").filter((id) => isRunning(id))
-      .reduce((sum, id) => sum + sessionSeconds(id), 0);
-    if (!extra && !isRunning(el.dataset.spent)) return;
+    let extra = 0;
+    if (el.dataset.subspent) {
+      const [taskId, subId] = splitTimerKey(el.dataset.subspent);
+      extra = liveSeconds(taskId, subId);
+    } else {
+      extra = String(el.dataset.spent || "").split(",").filter(Boolean)
+        .reduce((sum, id) => sum + liveSeconds(id), 0);
+    }
+    if (!extra) return;
     el.textContent = fmtHM(Number(el.dataset.base) + extra / 60);
   });
 }, 1000);
