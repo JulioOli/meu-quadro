@@ -1,16 +1,22 @@
 const KEY = "mesa-v1";
-const COLORS = ["#d7b07a", "#8fbfa8", "#6aa0d8", "#d4a054", "#b7a3d6", "#7eb8c9"];
+const COLORS = ["#bd93f9", "#8be9fd", "#50fa7b", "#ffb86c", "#ff79c6", "#f1fa8c"];
+const COL_ACCENTS = ["cyan", "orange", "yellow", "purple", "pink", "green"];
 
 const ui = {
   view: "kanban",
   q: "",
   projectId: "",
   sprintId: "",
+  tagFilter: "",
   hideDone: false,
   openId: null,
+  showMetrics: false,
   ganttMode: "month",
   ganttAnchor: startOfMonth(new Date()),
   timeDay: iso(new Date()),
+  editEntryId: null,
+  financeDay: iso(new Date()),
+  editExpenseId: null,
   focus: null,
   picker: null,
   draftName: "",
@@ -24,6 +30,7 @@ if (colorsRepaired) save();
 let dragged = false;
 let ganttDrag = null;
 let subDrag = null;
+let lastRenderedView = null;
 
 function defaultState() {
   return {
@@ -42,7 +49,27 @@ function defaultState() {
     entries: [],
     sprints: [],
     timers: [],
+    finance: { monthlyCeiling: 0, expenses: [] },
     seq: { task: 1, project: 1, sprint: 1 },
+  };
+}
+
+function normalizeFinance(data) {
+  const base = { monthlyCeiling: 0, expenses: [] };
+  const raw = data && data.finance ? data.finance : {};
+  const ceiling = Number(raw.monthlyCeiling);
+  return {
+    monthlyCeiling: Number.isFinite(ceiling) && ceiling >= 0 ? ceiling : 0,
+    expenses: Array.isArray(raw.expenses)
+      ? raw.expenses
+          .filter((e) => e && e.id && e.date != null)
+          .map((e) => ({
+            id: String(e.id),
+            amount: Math.max(0, Math.round((Number(e.amount) || 0) * 100) / 100),
+            description: String(e.description || ""),
+            date: String(e.date),
+          }))
+      : [],
   };
 }
 
@@ -77,6 +104,7 @@ function load() {
       ...data,
       columns: data.columns?.length ? data.columns : base.columns,
       types: data.types?.length ? data.types : base.types,
+      finance: normalizeFinance(data),
       seq: { ...base.seq, ...(data.seq || {}) },
     };
   } catch {
@@ -277,6 +305,58 @@ function fmtHM(min) {
   return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 }
 
+function fmtMoney(n) {
+  return (Number(n) || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+function moneyInputValue(n) {
+  return (Number(n) || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function parseMoney(s) {
+  let t = String(s || "").trim().replace(/R\$\s?/gi, "").replace(/\s/g, "");
+  if (!t) return null;
+  if (t.includes(",")) t = t.replace(/\./g, "").replace(",", ".");
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(n * 100) / 100;
+}
+
+/** Dia em que vira a fatura do cartão — o “mês” financeiro começa aqui. */
+const FINANCE_CYCLE_DAY = 6;
+
+function financeCycleStart(d) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  if (x.getDate() >= FINANCE_CYCLE_DAY) {
+    return new Date(x.getFullYear(), x.getMonth(), FINANCE_CYCLE_DAY);
+  }
+  return new Date(x.getFullYear(), x.getMonth() - 1, FINANCE_CYCLE_DAY);
+}
+
+function financeCycleEnd(start) {
+  return addDays(new Date(start.getFullYear(), start.getMonth() + 1, FINANCE_CYCLE_DAY), -1);
+}
+
+function financeCycleDays(start) {
+  return daysBetween(start, financeCycleEnd(start)) + 1;
+}
+
+function inFinanceCycle(dateStr, cycleStart) {
+  const d = parseISO(dateStr);
+  return d >= cycleStart && d <= financeCycleEnd(cycleStart);
+}
+
+function fmtCycleLabel(start) {
+  const end = financeCycleEnd(start);
+  const a = start.toLocaleDateString("pt-BR", { day: "numeric", month: "short" });
+  const b = end.toLocaleDateString("pt-BR", { day: "numeric", month: "short", year: "numeric" });
+  return `${a} – ${b}`;
+}
+
+function financeExpenses() {
+  return state.finance?.expenses || [];
+}
+
 function fmtHMS(total) {
   const s = Math.max(0, Math.floor(total));
   const h = Math.floor(s / 3600);
@@ -377,17 +457,61 @@ function splitTimerKey(key) {
 
 function visibleTasks() {
   const q = ui.q.trim().toLowerCase();
+  const tag = String(ui.tagFilter || "").toLowerCase();
   return state.tasks.filter((t) => {
     if (ui.projectId && t.projectId !== ui.projectId) return false;
     if (ui.sprintId === "none" && t.sprintId) return false;
     if (ui.sprintId && ui.sprintId !== "none" && t.sprintId !== ui.sprintId) return false;
     if (ui.hideDone && isDone(t)) return false;
+    if (tag && !(t.tags || []).some((x) => String(x).toLowerCase() === tag)) return false;
     if (!q) return true;
     const blob = [t.code, t.title, t.description, project(t.projectId)?.name, ...(t.tags || [])]
       .join(" ")
       .toLowerCase();
     return blob.includes(q);
   });
+}
+
+function allTags() {
+  const map = new Map();
+  state.tasks.forEach((t) => {
+    (t.tags || []).forEach((tag) => {
+      const key = String(tag || "").trim();
+      if (!key) return;
+      const low = key.toLowerCase();
+      if (!map.has(low)) map.set(low, key);
+    });
+  });
+  return [...map.values()].sort((a, b) => a.localeCompare(b, "pt-BR"));
+}
+
+function tagCount(tag) {
+  const low = String(tag).toLowerCase();
+  return state.tasks.filter((t) => (t.tags || []).some((x) => String(x).toLowerCase() === low)).length;
+}
+
+function colAccent(col, index) {
+  if (col.kind === "done") return "green";
+  if (col.kind === "start") return "cyan";
+  return COL_ACCENTS[index % COL_ACCENTS.length];
+}
+
+function metricsScope() {
+  if (ui.sprintId && ui.sprintId !== "none") {
+    const s = sprint(ui.sprintId);
+    return {
+      label: s ? `Sprint ${s.name}` : "Sprint",
+      tasks: state.tasks.filter((t) => t.sprintId === ui.sprintId),
+    };
+  }
+  const active = state.sprints.find((s) => sprintStatus(s) === "vigente");
+  if (active) {
+    return {
+      label: `Sprint ${active.name}`,
+      tasks: state.tasks.filter((t) => t.sprintId === active.id),
+    };
+  }
+  return { label: "Quadro", tasks: state.tasks.slice() };
 }
 
 function tasksIn(colId) {
@@ -406,27 +530,41 @@ function sprintStatus(s) {
 }
 
 function shell() {
+  const viewEnter = lastRenderedView !== ui.view;
   return `
     <div class="app">
       <header class="top">
-        <div class="top-bar">
-          <div class="brand"><strong>Mesa</strong><span>projetos pessoais</span></div>
-          ${accountBtn()}
-        </div>
+        <div class="brand"><strong>Mesa</strong><span>projetos pessoais</span></div>
         <nav class="nav">
           ${navBtn("kanban", "Kanban")}
           ${navBtn("lista", "Lista")}
           ${navBtn("gantt", "Gantt")}
           ${navBtn("tempo", "Tempo")}
+          ${navBtn("financas", "Finanças")}
           ${navBtn("projetos", "Projetos")}
           ${navBtn("sprints", "Sprints")}
           ${navBtn("ajustes", "Ajustes")}
         </nav>
-        ${timerPill()}
+        <div class="top-right">
+          ${timerPill()}
+          <div class="top-actions">
+            <button type="button" class="metrics-btn" data-act="open-metrics" title="Métricas do quadro">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M3 3v18h18"></path>
+                <path d="M7 14l4-4 3 3 6-7"></path>
+              </svg>
+              Métricas
+            </button>
+            ${accountBtn()}
+          </div>
+        </div>
       </header>
-      ${viewBody()}
+      <div class="view-body${viewEnter ? " is-entering" : ""}">${viewBody()}</div>
       <p class="foot">Esta conta sincroniza o quadro entre os aparelhos em que você entrar com o Google.</p>
       ${drawer()}
+      ${entryDrawer()}
+      ${financeDrawer()}
+      ${metricsModal()}
     </div>`;
 }
 
@@ -463,6 +601,19 @@ function timerPill() {
   return `<div class="timer-pills">${pills}</div>`;
 }
 
+function quickFilters() {
+  const tags = allTags();
+  const chips = [
+    `<button type="button" class="tag-filter ${!ui.tagFilter ? "active" : ""}" data-act="tag-filter" data-tag="">
+      Todas<span class="count">${state.tasks.length}</span>
+    </button>`,
+    ...tags.map((tag) => `<button type="button" class="tag-filter ${ui.tagFilter.toLowerCase() === tag.toLowerCase() ? "active" : ""}" data-act="tag-filter" data-tag="${esc(tag)}">
+      ${esc(tag)}<span class="count">${tagCount(tag)}</span>
+    </button>`),
+  ];
+  return `<div class="quick-filters"><span class="label">Filtros rápidos</span>${chips.join("")}</div>`;
+}
+
 function filters() {
   const projects = state.projects.map((p) => `<option value="${p.id}" ${ui.projectId === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("");
   const sprints = state.sprints.map((s) => `<option value="${s.id}" ${ui.sprintId === s.id ? "selected" : ""}>${esc(s.name)}</option>`).join("");
@@ -483,7 +634,7 @@ function filters() {
     </select>
     <label class="inline muted"><input id="hide-done" type="checkbox" ${ui.hideDone ? "checked" : ""}> Ocultar concluídas</label>
     <button class="btn primary" data-act="new-task">Nova tarefa</button>
-  </div>`;
+  </div>${quickFilters()}`;
 }
 
 function viewBody() {
@@ -491,6 +642,7 @@ function viewBody() {
     return filters() + ({ kanban: kanban, lista: lista, gantt: ganttView }[ui.view])();
   }
   if (ui.view === "tempo") return tempoView();
+  if (ui.view === "financas") return financasView();
   if (ui.view === "projetos") return projetosView();
   if (ui.view === "sprints") return sprintsView();
   return ajustesView();
@@ -520,7 +672,7 @@ function card(t) {
     <div class="tags">
       <span class="tag">${esc(t.code)}</span>
       ${p ? `<span class="tag"><i class="dot" style="background:${esc(p.color)}"></i> ${esc(p.name)}</span>` : ""}
-      ${(t.tags || []).map((tag) => `<span class="tag">${esc(tag)}</span>`).join("")}
+      ${(t.tags || []).map((tag) => `<button type="button" class="tag" data-act="tag-filter" data-tag="${esc(tag)}" title="Filtrar por ${esc(tag)}">${esc(tag)}</button>`).join("")}
     </div>
     <div class="card-foot">
       <span class="card-time">${timeBits(t)}</span>
@@ -533,21 +685,65 @@ function kanban() {
   if (!state.tasks.length) {
     return `<div class="panel"><div class="empty">Nenhuma tarefa ainda. Crie a primeira ou <button class="btn" data-act="seed">carregue um exemplo</button>.</div></div>`;
   }
-  return `<div class="board">${state.columns.map((col) => {
+  return `<div class="board">${state.columns.map((col, index) => {
     const items = tasksIn(col.id);
+    const accent = colAccent(col, index);
     const est = items.reduce((a, t) => a + (t.estimateMin || 0), 0);
     const rep = items.reduce((a, t) => a + logged(t.id), 0);
     const liveIds = items.filter((t) => taskLive(t.id)).map((t) => t.id);
     const repNow = rep + liveIds.reduce((sum, id) => sum + liveSeconds(id) / 60, 0);
     return `<section class="col" data-col="${col.id}">
       <div class="col-head">
-        <div><h2>${esc(col.name)} <span class="muted">${items.length}</span></h2>
-        <div class="meta">Estimado ${fmtHM(est)} · Reportado <span class="spent" data-spent="${liveIds.join(",")}" data-base="${rep}">${fmtHM(repNow)}</span></div></div>
+        <div>
+          <h2><span class="col-dot ${accent}"></span>${esc(col.name)} <span class="col-count ${accent}">${items.length}</span></h2>
+          <div class="meta">Estimado ${fmtHM(est)} · Reportado <span class="spent" data-spent="${liveIds.join(",")}" data-base="${rep}">${fmtHM(repNow)}</span></div>
+        </div>
         <button class="icon-btn" data-act="new-task" data-status="${col.id}" title="Nova tarefa aqui">+</button>
       </div>
       <div class="cards">${items.map(card).join("") || `<div class="empty">Arraste tarefas para cá</div>`}</div>
     </section>`;
   }).join("")}</div>`;
+}
+
+function metricsModal() {
+  if (!ui.showMetrics) return "";
+  const scope = metricsScope();
+  const total = scope.tasks.length;
+  const done = scope.tasks.filter(isDone).length;
+  const rate = total ? Math.round((done / total) * 100) : 0;
+  const rows = state.columns.map((col, index) => {
+    const count = scope.tasks.filter((t) => t.statusId === col.id).length;
+    const pct = total ? Math.round((count / total) * 100) : 0;
+    const accent = colAccent(col, index);
+    return `<div class="metrics-row">
+      <div class="inline"><span>${esc(col.name)}</span><span class="val">${count} (${pct}%)</span></div>
+      <div class="metrics-bar"><span class="${accent}" style="width:${pct}%"></span></div>
+    </div>`;
+  }).join("");
+  return `<div class="metrics-back" data-act="close-metrics">
+    <div class="metrics-modal" data-act="metrics-stop">
+      <div class="metrics-head">
+        <h2>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M3 3v18h18"></path>
+            <path d="M7 14l4-4 3 3 6-7"></path>
+          </svg>
+          Dashboard Métricas · ${esc(scope.label)}
+        </h2>
+        <button type="button" class="btn ghost" data-act="close-metrics" aria-label="Fechar">✕</button>
+      </div>
+      <div class="metrics-grid">
+        <div class="metrics-card"><span class="label">Total Tarefas</span><span class="value purple">${total}</span></div>
+        <div class="metrics-card"><span class="label">Concluídas</span><span class="value green">${done}</span></div>
+        <div class="metrics-card"><span class="label">Taxa Conclusão</span><span class="value pink">${rate}%</span></div>
+      </div>
+      <h3 class="metrics-section-title">Distribuição por coluna</h3>
+      ${rows || `<p class="muted">Nenhuma tarefa neste recorte.</p>`}
+      <div class="metrics-foot">
+        <button type="button" class="btn primary" data-act="close-metrics">Fechar Dashboard</button>
+      </div>
+    </div>
+  </div>`;
 }
 
 function lista() {
@@ -679,12 +875,16 @@ function tempoView() {
     <div class="grid-2">
       <div>
         <h3>Lançamentos</h3>
+        <p class="muted" style="margin-top:0">Clique num lançamento para editar, como no timesheet.</p>
         ${dayEntries.map((e) => {
           const t = task(e.taskId);
-          return `<div class="comment inline" style="justify-content:space-between">
-            <div><b>${fmtHM(e.minutes)}</b> ${esc(t?.title || "Tarefa removida")}<div class="meta">${esc(e.note || "")}</div></div>
-            <button class="btn danger" data-act="del-entry" data-id="${e.id}">Excluir</button>
-          </div>`;
+          return `<button type="button" class="comment expense-row ${ui.editEntryId === e.id ? "active" : ""}" data-act="edit-entry" data-id="${e.id}">
+            <span class="expense-main">
+              <b>${fmtHM(e.minutes)}</b> ${esc(t?.title || "Tarefa removida")}
+              <span class="meta">${esc(t?.code || "")}${e.note ? ` · ${esc(e.note)}` : ""}</span>
+            </span>
+            <span class="meta">Editar</span>
+          </button>`;
         }).join("") || `<div class="empty">Nenhum apontamento neste dia.</div>`}
       </div>
       <div class="stack">
@@ -695,6 +895,105 @@ function tempoView() {
           <button class="btn primary" data-act="add-entry">Adicionar</button>` : `<p class="muted">Crie uma tarefa antes de lançar tempo.</p>`}
         <h3>Por projeto</h3>
         ${Object.entries(byProject).map(([n, m]) => `<div class="inline" style="justify-content:space-between"><span>${esc(n)}</span><b>${fmtHM(m)}</b></div>`).join("") || `<p class="muted">Nada neste dia.</p>`}
+      </div>
+    </div>
+  </div>`;
+}
+
+function financasView() {
+  if (!state.finance) state.finance = normalizeFinance({});
+  const ceiling = Number(state.finance.monthlyCeiling) || 0;
+  const anchor = parseISO(ui.financeDay);
+  const cycleStart = financeCycleStart(anchor);
+  const cycleEnd = financeCycleEnd(cycleStart);
+  const monthDays = financeCycleDays(cycleStart);
+  const weeklyCeiling = monthDays ? (ceiling / monthDays) * 7 : 0;
+  const dailyCeiling = monthDays ? ceiling / monthDays : 0;
+  const weekStart = startOfWeek(anchor);
+  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  const expenses = financeExpenses();
+  const monthExpenses = expenses.filter((e) => inFinanceCycle(e.date, cycleStart));
+  const weekExpenses = expenses.filter((e) => {
+    const d = parseISO(e.date);
+    return d >= weekStart && d < addDays(weekStart, 7);
+  });
+  const monthSpent = monthExpenses.reduce((a, e) => a + e.amount, 0);
+  const weekSpent = weekExpenses.reduce((a, e) => a + e.amount, 0);
+  const dayExpenses = expenses.filter((e) => e.date === ui.financeDay);
+  const daySpent = dayExpenses.reduce((a, e) => a + e.amount, 0);
+  const monthLeft = ceiling - monthSpent;
+  const weekLeft = weeklyCeiling - weekSpent;
+  const monthPct = ceiling > 0 ? Math.min(100, Math.round((monthSpent / ceiling) * 100)) : 0;
+  const weekPct = weeklyCeiling > 0 ? Math.min(100, Math.round((weekSpent / weeklyCeiling) * 100)) : 0;
+  const monthOver = ceiling > 0 && monthSpent > ceiling;
+  const weekOver = weeklyCeiling > 0 && weekSpent > weeklyCeiling;
+  const monthLabel = fmtCycleLabel(cycleStart);
+  const weekCards = days.map((d) => {
+    const key = iso(d);
+    const sum = expenses.filter((e) => e.date === key).reduce((a, e) => a + e.amount, 0);
+    return `<button class="day-card ${key === ui.financeDay ? "active" : ""}" data-act="finance-day" data-day="${key}">
+      <span class="meta">${fmtLong(key)}</span><b>${fmtMoney(sum)}</b>
+    </button>`;
+  }).join("");
+  return `<div class="panel">
+    <div class="inline" style="justify-content:space-between">
+      <h2 style="margin:0;font-family:Georgia,serif">Finanças · ${esc(monthLabel)}</h2>
+      <div class="inline">
+        <button class="btn" data-act="finance-prev">←</button>
+        <button class="btn" data-act="finance-today">Hoje</button>
+        <button class="btn" data-act="finance-next">→</button>
+      </div>
+    </div>
+    <p class="muted">Ciclo da fatura: dia ${FINANCE_CYCLE_DAY} ao dia ${FINANCE_CYCLE_DAY - 1} do mês seguinte (${fmtDate(iso(cycleStart))} – ${fmtDate(iso(cycleEnd))}).</p>
+    <div class="grid-2" style="margin:14px 0">
+      <div class="stack">
+        <h3>Teto do ciclo</h3>
+        <label>Quanto posso gastar neste ciclo
+          <input id="finance-ceiling" class="field" inputmode="decimal" placeholder="Ex.: 2500 ou 2.500,00" value="${ceiling ? esc(String(ceiling).replace(".", ",")) : ""}">
+        </label>
+        <button class="btn primary" data-act="save-ceiling">Salvar teto</button>
+        <p class="muted">Com base no teto, a semana fica em <b style="color:var(--text)">${fmtMoney(weeklyCeiling)}</b> (${fmtMoney(dailyCeiling)} por dia · ${monthDays} dias).</p>
+      </div>
+      <div class="stack">
+        <h3>Resumo</h3>
+        <div class="inline" style="justify-content:space-between"><span>Gasto no ciclo</span><b class="${monthOver ? "finance-over" : ""}">${fmtMoney(monthSpent)}</b></div>
+        <div class="barline"><span class="${monthOver ? "over" : ""}" style="width:${monthPct}%"></span></div>
+        <div class="inline" style="justify-content:space-between"><span>Restante no ciclo</span><b class="${monthLeft < 0 ? "finance-over" : ""}">${fmtMoney(monthLeft)}</b></div>
+        <div class="inline" style="justify-content:space-between;margin-top:10px"><span>Gasto na semana</span><b class="${weekOver ? "finance-over" : ""}">${fmtMoney(weekSpent)}</b></div>
+        <div class="barline"><span class="${weekOver ? "over" : ""}" style="width:${weekPct}%"></span></div>
+        <div class="inline" style="justify-content:space-between"><span>Restante na semana</span><b class="${weekLeft < 0 ? "finance-over" : ""}">${fmtMoney(weekLeft)}</b></div>
+        <p class="muted" style="margin-top:10px">Teto semanal ${fmtMoney(weeklyCeiling)} · dia selecionado ${fmtMoney(daySpent)}</p>
+      </div>
+    </div>
+    <div class="inline" style="justify-content:space-between;margin-top:8px">
+      <h3 style="margin:0">${esc(fmtLong(ui.financeDay))}</h3>
+      <span class="muted">${dayExpenses.length} gasto(s) · ${fmtMoney(daySpent)}</span>
+    </div>
+    <div class="week">${weekCards}</div>
+    <div class="grid-2">
+      <div>
+        <h3>Gastos do dia</h3>
+        <p class="muted" style="margin-top:0">Clique num lançamento para editar, como no timesheet.</p>
+        ${dayExpenses.map((e) => `<button type="button" class="comment expense-row ${ui.editExpenseId === e.id ? "active" : ""}" data-act="edit-expense" data-id="${e.id}">
+          <span class="expense-main"><b>${fmtMoney(e.amount)}</b> ${esc(e.description || "Sem descrição")}<span class="meta">${fmtDate(e.date)}</span></span>
+          <span class="meta">Editar</span>
+        </button>`).join("") || `<div class="empty">Nenhum gasto neste dia.</div>`}
+        <h3 style="margin-top:18px">Ciclo ${esc(monthLabel)}</h3>
+        ${monthExpenses.length ? `<div class="table-wrap" style="margin:0"><table>
+          <thead><tr><th>Dia</th><th>Descrição</th><th>Valor</th></tr></thead>
+          <tbody>${[...monthExpenses].sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id)).map((e) => `<tr class="expense-row ${ui.editExpenseId === e.id ? "active" : ""}" data-act="edit-expense" data-id="${e.id}" title="Editar lançamento">
+            <td>${fmtDate(e.date)}</td>
+            <td>${esc(e.description || "—")}</td>
+            <td>${fmtMoney(e.amount)}</td>
+          </tr>`).join("")}</tbody>
+        </table></div>` : `<p class="muted">Ainda não há gastos neste ciclo.</p>`}
+      </div>
+      <div class="stack">
+        <h3>Adicionar gasto</h3>
+        <label>Valor<input id="expense-amount" class="field" inputmode="decimal" placeholder="Ex.: 32,90"></label>
+        <label>No que gastei<input id="expense-desc" class="field" placeholder="Mercado, transporte, café…"></label>
+        <label>Dia<input id="expense-date" class="field" type="date" value="${esc(ui.financeDay)}"></label>
+        <button class="btn primary" data-act="add-expense">Registrar gasto</button>
       </div>
     </div>
   </div>`;
@@ -821,6 +1120,85 @@ function subtaskRow(t, s) {
   </div>`;
 }
 
+function entryDrawer() {
+  if (!ui.editEntryId) return "";
+  const e = state.entries.find((x) => x.id === ui.editEntryId);
+  if (!e) {
+    ui.editEntryId = null;
+    return "";
+  }
+  const options = state.tasks.map((t) => `<option value="${t.id}" ${t.id === e.taskId ? "selected" : ""}>${esc(t.code)} · ${esc(t.title)}</option>`).join("");
+  const orphan = !state.tasks.some((t) => t.id === e.taskId)
+    ? `<option value="${esc(e.taskId)}" selected>Tarefa removida</option>`
+    : "";
+  return `<div class="drawer-back" data-act="close-entry"></div>
+    <aside class="drawer">
+      <div class="inline" style="justify-content:space-between">
+        <h2 style="margin:0;font-family:Georgia,serif">Editar lançamento</h2>
+        <button class="btn" data-act="close-entry">Fechar</button>
+      </div>
+      <div class="stack" style="margin-top:14px">
+        <label>Tarefa
+          <select id="edit-entry-task" class="field">${orphan}${options}</select>
+        </label>
+        <label>Data *
+          <input id="edit-entry-date" class="field" type="date" value="${esc(e.date)}">
+        </label>
+        <p class="meta">Dia em que o trabalho foi feito.</p>
+        <label>Duração *
+          <input id="edit-entry-min" class="field" value="${esc(fmtHM(e.minutes))}" placeholder="HH:MM (ex.: 01:30)">
+        </label>
+        <p class="meta">${fmtHM(e.minutes)} de trabalho</p>
+        <label>Descrição
+          <textarea id="edit-entry-note" class="field" placeholder="O que foi feito">${esc(e.note || "")}</textarea>
+        </label>
+      </div>
+      <div class="inline" style="justify-content:space-between;margin-top:18px;gap:8px;flex-wrap:wrap">
+        <button class="btn danger" data-act="del-entry" data-id="${e.id}">Excluir</button>
+        <div class="inline">
+          <button class="btn" data-act="close-entry">Cancelar</button>
+          <button class="btn primary" data-act="save-entry">Salvar ${fmtHM(e.minutes)}</button>
+        </div>
+      </div>
+    </aside>`;
+}
+
+function financeDrawer() {
+  if (!ui.editExpenseId) return "";
+  const e = financeExpenses().find((x) => x.id === ui.editExpenseId);
+  if (!e) {
+    ui.editExpenseId = null;
+    return "";
+  }
+  return `<div class="drawer-back" data-act="close-expense"></div>
+    <aside class="drawer">
+      <div class="inline" style="justify-content:space-between">
+        <h2 style="margin:0;font-family:Georgia,serif">Editar lançamento</h2>
+        <button class="btn" data-act="close-expense">Fechar</button>
+      </div>
+      <div class="stack" style="margin-top:14px">
+        <label>Valor *
+          <input id="edit-expense-amount" class="field" inputmode="decimal" value="${esc(moneyInputValue(e.amount))}" placeholder="Ex.: 32,90">
+        </label>
+        <p class="meta">${fmtMoney(e.amount)} no lançamento atual</p>
+        <label>No que gastei
+          <input id="edit-expense-desc" class="field" value="${esc(e.description || "")}" placeholder="Mercado, transporte, café…">
+        </label>
+        <label>Dia *
+          <input id="edit-expense-date" class="field" type="date" value="${esc(e.date)}">
+        </label>
+        <p class="meta">Dia em que o gasto aconteceu.</p>
+      </div>
+      <div class="inline" style="justify-content:space-between;margin-top:18px;gap:8px;flex-wrap:wrap">
+        <button class="btn danger" data-act="del-expense" data-id="${e.id}">Excluir</button>
+        <div class="inline">
+          <button class="btn" data-act="close-expense">Cancelar</button>
+          <button class="btn primary" data-act="save-expense">Salvar ${fmtMoney(e.amount)}</button>
+        </div>
+      </div>
+    </aside>`;
+}
+
 function drawer() {
   const t = task(ui.openId);
   if (!t) return "";
@@ -895,6 +1273,7 @@ function render() {
   const start = active && active.selectionStart;
   const end = active && active.selectionEnd;
   document.getElementById("app").innerHTML = shell();
+  lastRenderedView = ui.view;
   if (ui.focus) {
     const el = document.getElementById(ui.focus);
     if (el) {
@@ -1082,12 +1461,31 @@ function onClick(e) {
     render();
     return;
   }
+  if (act === "open-metrics") {
+    ui.showMetrics = true;
+    render();
+    return;
+  }
+  if (act === "close-metrics") {
+    ui.showMetrics = false;
+    render();
+    return;
+  }
+  if (act === "metrics-stop") return;
+  if (act === "tag-filter") {
+    ui.tagFilter = el.dataset.tag || "";
+    if (ui.view !== "kanban" && ui.view !== "lista" && ui.view !== "gantt") ui.view = "kanban";
+    render();
+    return;
+  }
   if (act === "new-task") {
     createTask(el.dataset.status);
     return;
   }
   if (act === "open-task") {
     ui.openId = el.dataset.id || el.dataset.task;
+    ui.editExpenseId = null;
+    ui.editEntryId = null;
     render();
     return;
   }
@@ -1096,6 +1494,16 @@ function onClick(e) {
     readDrawer();
     ui.openId = null;
     save();
+    render();
+    return;
+  }
+  if (act === "close-entry") {
+    ui.editEntryId = null;
+    render();
+    return;
+  }
+  if (act === "close-expense") {
+    ui.editExpenseId = null;
     render();
     return;
   }
@@ -1187,12 +1595,41 @@ function onClick(e) {
       id: uid(), taskId, date: ui.timeDay, minutes,
       note: document.getElementById("entry-note").value.trim(),
     });
+    ui.editEntryId = null;
+    save();
+    render();
+    return;
+  }
+  if (act === "edit-entry") {
+    ui.editEntryId = el.dataset.id;
+    ui.openId = null;
+    ui.editExpenseId = null;
+    const en = state.entries.find((x) => x.id === ui.editEntryId);
+    if (en?.date) ui.timeDay = en.date;
+    render();
+    return;
+  }
+  if (act === "save-entry") {
+    const en = state.entries.find((x) => x.id === ui.editEntryId);
+    if (!en) return;
+    const minutes = parseHM(document.getElementById("edit-entry-min").value);
+    const taskId = document.getElementById("edit-entry-task").value;
+    const date = document.getElementById("edit-entry-date").value || en.date;
+    if (!taskId || minutes == null || minutes <= 0 || !date) return;
+    en.taskId = taskId;
+    en.minutes = minutes;
+    en.date = date;
+    en.note = document.getElementById("edit-entry-note").value.trim();
+    ui.timeDay = date;
+    ui.editEntryId = null;
     save();
     render();
     return;
   }
   if (act === "del-entry") {
+    if (!confirm("Excluir este lançamento de tempo?")) return;
     state.entries = state.entries.filter((en) => en.id !== el.dataset.id);
+    if (ui.editEntryId === el.dataset.id) ui.editEntryId = null;
     save();
     render();
     return;
@@ -1286,6 +1723,78 @@ function onClick(e) {
   }
   if (act === "time-today") {
     ui.timeDay = todayISO();
+    render();
+    return;
+  }
+  if (act === "finance-day") {
+    ui.financeDay = el.dataset.day;
+    render();
+    return;
+  }
+  if (act === "finance-prev" || act === "finance-next") {
+    ui.financeDay = iso(addDays(parseISO(ui.financeDay), act === "finance-next" ? 1 : -1));
+    render();
+    return;
+  }
+  if (act === "finance-today") {
+    ui.financeDay = todayISO();
+    render();
+    return;
+  }
+  if (act === "save-ceiling") {
+    if (!state.finance) state.finance = normalizeFinance({});
+    const amount = parseMoney(document.getElementById("finance-ceiling").value);
+    if (amount == null) return;
+    state.finance.monthlyCeiling = amount;
+    save();
+    render();
+    return;
+  }
+  if (act === "add-expense") {
+    if (!state.finance) state.finance = normalizeFinance({});
+    const amount = parseMoney(document.getElementById("expense-amount").value);
+    const description = document.getElementById("expense-desc").value.trim();
+    const date = document.getElementById("expense-date").value || ui.financeDay;
+    if (amount == null || amount <= 0 || !date) return;
+    state.finance.expenses.push({ id: uid(), amount, description, date });
+    ui.financeDay = date;
+    ui.editExpenseId = null;
+    save();
+    render();
+    return;
+  }
+  if (act === "edit-expense") {
+    ui.editExpenseId = el.dataset.id;
+    ui.openId = null;
+    ui.editEntryId = null;
+    const exp = financeExpenses().find((x) => x.id === ui.editExpenseId);
+    if (exp?.date) ui.financeDay = exp.date;
+    render();
+    return;
+  }
+  if (act === "save-expense") {
+    if (!state.finance) state.finance = normalizeFinance({});
+    const exp = state.finance.expenses.find((x) => x.id === ui.editExpenseId);
+    if (!exp) return;
+    const amount = parseMoney(document.getElementById("edit-expense-amount").value);
+    const description = document.getElementById("edit-expense-desc").value.trim();
+    const date = document.getElementById("edit-expense-date").value || exp.date;
+    if (amount == null || amount <= 0 || !date) return;
+    exp.amount = amount;
+    exp.description = description;
+    exp.date = date;
+    ui.financeDay = date;
+    ui.editExpenseId = null;
+    save();
+    render();
+    return;
+  }
+  if (act === "del-expense") {
+    if (!state.finance) state.finance = normalizeFinance({});
+    if (!confirm("Excluir este lançamento?")) return;
+    state.finance.expenses = state.finance.expenses.filter((e) => e.id !== el.dataset.id);
+    if (ui.editExpenseId === el.dataset.id) ui.editExpenseId = null;
+    save();
     render();
     return;
   }
@@ -1423,7 +1932,16 @@ app.addEventListener("change", (e) => {
       try {
         const data = JSON.parse(reader.result);
         if (!data.tasks || !data.columns) throw new Error("arquivo incompleto");
-        state = { ...defaultState(), ...data };
+        const base = defaultState();
+        state = {
+          ...base,
+          ...data,
+          columns: data.columns?.length ? data.columns : base.columns,
+          types: data.types?.length ? data.types : base.types,
+          finance: normalizeFinance(data),
+          seq: { ...base.seq, ...(data.seq || {}) },
+        };
+        state.timers = normalizeTimers(state);
         ui.openId = null;
         save();
         render();
@@ -1479,6 +1997,21 @@ app.addEventListener("keydown", (e) => {
   }
   if (e.key === "Enter" && e.target.id === "new-sub") { e.preventDefault(); onClick({ target: document.querySelector("[data-act=add-sub]") }); }
   if (e.key === "Enter" && e.target.id === "new-comment") { e.preventDefault(); onClick({ target: document.querySelector("[data-act=add-comment]") }); }
+  if (e.key === "Escape" && ui.showMetrics) {
+    ui.showMetrics = false;
+    render();
+    return;
+  }
+  if (e.key === "Escape" && ui.editEntryId) {
+    ui.editEntryId = null;
+    render();
+    return;
+  }
+  if (e.key === "Escape" && ui.editExpenseId) {
+    ui.editExpenseId = null;
+    render();
+    return;
+  }
   if (e.key === "Escape" && ui.openId) {
     readDrawer();
     ui.openId = null;
@@ -1739,6 +2272,7 @@ function adoptRemote(data) {
     ...copy,
     columns: copy.columns?.length ? copy.columns : base.columns,
     types: copy.types?.length ? copy.types : base.types,
+    finance: normalizeFinance(copy),
     seq: { ...base.seq, ...(copy.seq || {}) },
   };
   state.timers = normalizeTimers(state);
@@ -1754,7 +2288,13 @@ function startSync() {
     cloudListening = true;
     boardRef().onSnapshot((snap) => {
       if (!snap.exists) {
-        if ((state.tasks || []).length || (state.projects || []).length || (state.entries || []).length) pushCloud();
+        if (
+          (state.tasks || []).length
+          || (state.projects || []).length
+          || (state.entries || []).length
+          || (state.finance?.expenses || []).length
+          || (state.finance?.monthlyCeiling || 0) > 0
+        ) pushCloud();
         return;
       }
       const data = snap.data();

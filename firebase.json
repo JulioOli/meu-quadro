@@ -11,7 +11,8 @@
       "**/.git/**",
       ".git/**",
       "**/node_modules/**",
-      "README.md"
+      "README.md",
+      "dracula_kanban_board.html"
     ],
     "headers": [
       {
